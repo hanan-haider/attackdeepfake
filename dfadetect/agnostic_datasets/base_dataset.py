@@ -5,7 +5,7 @@ import pandas as pd
 import soundfile as sf
 import torchaudio
 from torch.utils.data import Dataset
-from torch.utils.data.dataset import T_co
+#from torch.utils.data.dataset import T_co
 
 from dfadetect.datasets import AudioDataset, PadDataset
 
@@ -51,7 +51,7 @@ class SimpleAudioFakeDataset(Dataset):
         self.samples = tuple_samples
         return self.samples
 
-    def __getitem__(self, index) -> T_co:
+    def __getitem__(self, index):
 
         if isinstance(self.samples, pd.DataFrame):
             sample = self.samples.iloc[index]

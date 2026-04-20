@@ -3,7 +3,6 @@ import logging
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Callable, List, Optional
-from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -110,7 +109,7 @@ class GDTrainer(Trainer):
             num_total = 0.0
             model.train()
 
-            for i, (batch_x, _, batch_y) in enumerate(tqdm(train_loader, desc="Training", total=len(train_loader))):
+            for i, (batch_x, _, batch_y) in enumerate(train_loader):
                 batch_size = batch_x.size(0)
                 num_total += batch_size
 
@@ -129,7 +128,7 @@ class GDTrainer(Trainer):
 
                 if i % 100 == 0:
                     LOGGER.info(
-                         f"[{epoch:04d}][{i:05d}]: {running_loss / num_total} {num_correct/num_total*100}")
+                         f"[Epoch {epoch:04d}] [Step {i:05d}] | Loss: {avg_loss:.4f} | Acc: {accuracy:.2f}%")
 
                 optim.zero_grad()
                 batch_loss.backward()
@@ -144,7 +143,7 @@ class GDTrainer(Trainer):
             num_correct = 0.0
             num_total = 0.0
             model.eval()
-            for batch_x, _, batch_y in tqdm(test_loader, desc="Testing", total=len(test_loader)):
+            for batch_x, _, batch_y in test_loader:
 
                 batch_size = batch_x.size(0)
                 num_total += batch_size
@@ -175,7 +174,7 @@ class GDTrainer(Trainer):
                 best_model = deepcopy(model.state_dict())
 
             LOGGER.info(
-                f"[{epoch:04d}]: {running_loss} - train acc: {train_accuracy} - test_acc: {test_acc}")
+                f"[{epoch:04d}]: {running_loss} -- train acc: {train_accuracy} -- test_acc: {test_acc}")
 
         model.load_state_dict(best_model)
         return model

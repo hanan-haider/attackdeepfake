@@ -128,7 +128,7 @@ class GDTrainer(Trainer):
 
                 if i % 100 == 0:
                     LOGGER.info(
-                         f"[Epoch {epoch:04d}] [Step {i:05d}] | Loss: {avg_loss:.4f} | Acc: {accuracy:.2f}%")
+                         f"[Epoch {epoch:04d}] [Step {i:05d}] | Loss: {running_loss / num_total:.4f} | Acc: {num_correct / num_total * 100:.2f}%")
 
                 optim.zero_grad()
                 batch_loss.backward()

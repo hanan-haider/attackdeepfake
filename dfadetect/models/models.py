@@ -1,7 +1,7 @@
 from copy import deepcopy
 from typing import Dict
 
-from dfadetect.models import lcnn, mesonet, raw_net2, xception
+from dfadetect.models import lcnn #, mesonet, raw_net2, xception
 from experiment_config import RAW_NET_CONFIG
 
 

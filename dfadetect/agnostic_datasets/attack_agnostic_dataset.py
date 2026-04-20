@@ -61,7 +61,8 @@ class AttackAgnosticDataset(SimpleAudioFakeDataset):
             raise NotImplementedError
 
         if diff_length > 0:
-            bonafide = samples.get_group("bonafide").sample(diff_length, replace=True)
+            bonafide = samples.get_group(("bonafide",)).sample(diff_length, replace=True)
+            #bonafide = samples.get_group("bonafide").sample(diff_length, replace=True)
             self.samples = pd.concat([self.samples, bonafide], ignore_index=True)
 
     def undersample_dataset(self):

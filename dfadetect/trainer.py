@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from dfadetect import cnn_features
-from dfadetect.datasets import TransformDataset
+#from dfadetect.datasets import TransformDataset
 
 LOGGER = logging.getLogger(__name__)
 

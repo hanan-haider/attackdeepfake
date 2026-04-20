@@ -10,7 +10,7 @@ from torchaudio.functional import apply_codec
 
 #from dfadetect.lfcc import LFCC
 #from dfadetect.utils import find_wav_files
-.
+
 LOGGER = logging.getLogger(__name__)
 
 

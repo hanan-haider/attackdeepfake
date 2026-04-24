@@ -2,7 +2,7 @@ from copy import deepcopy
 from typing import Dict
 
 from dfadetect.models import lcnn #, mesonet, raw_net2, xception
-#from experiment_config import RAW_NET_CONFIG
+from experiment_config import RAW_NET_CONFIG
 
 
 def get_model(model_name: str, config: Dict, device:str):
@@ -11,7 +11,7 @@ def get_model(model_name: str, config: Dict, device:str):
     elif model_name == "mesonet_inception":
         return mesonet.MesoInception4(num_classes=1, **config)
     elif model_name == "lcnn":
-        return lcnn.LCNN(**config)
+        return lcnn.ViTAudioEncoder(**config)
     elif model_name == "xception":
         return xception.xception(num_classes=1, pretrained=None, **config)
     else:

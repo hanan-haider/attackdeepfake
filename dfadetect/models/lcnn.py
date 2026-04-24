@@ -1,239 +1,192 @@
 """
-Improved LCNN for Audio Deepfake Detection (Fixed)
+ViT-based Audio Deepfake Detector
+Drop-in replacement for LCNN baseline.
+Input:  (batch, channels, num_coefficients, time_frames)  — same as LCNN
+Output: (batch, 1) feature vector  → pass through sigmoid for score
 """
-import sys
+
 import torch
-import torch.nn as torch_nn
-import torch.nn.functional as F
+import torch.nn as nn
+import math
 
 
-class BLSTMLayer(torch_nn.Module):
-    def __init__(self, input_dim, output_dim):
+class PatchEmbed(nn.Module):
+    """Split spectrogram into patches and embed them."""
+    def __init__(self, in_channels=3, patch_size=(4, 4), embed_dim=256):
         super().__init__()
-        if output_dim % 2 != 0:
-            sys.exit(1)
-        self.l_blstm = torch_nn.LSTM(
-            input_dim, output_dim // 2,
-            bidirectional=True, batch_first=True
+        self.proj = nn.Conv2d(
+            in_channels, embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size
         )
 
     def forward(self, x):
-        blstm_data, _ = self.l_blstm(x)
-        return blstm_data
+        # x: (B, C, H, W) → (B, embed_dim, H/ph, W/pw) → (B, N, embed_dim)
+        x = self.proj(x)                      # (B, D, H', W')
+        x = x.flatten(2).transpose(1, 2)      # (B, N, D)
+        return x
 
 
-class MaxFeatureMap2D(torch_nn.Module):
-    def __init__(self, max_dim=1):
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads, dropout=0.1):
         super().__init__()
-        self.max_dim = max_dim
-
-    def forward(self, inputs):
-        shape = list(inputs.size())
-        if self.max_dim >= len(shape):
-            sys.exit(1)
-        if shape[self.max_dim] // 2 * 2 != shape[self.max_dim]:
-            sys.exit(1)
-        shape[self.max_dim] = shape[self.max_dim] // 2
-        shape.insert(self.max_dim, 2)
-        m, _ = inputs.view(*shape).max(self.max_dim)
-        return m
-
-
-class SEBlock(torch_nn.Module):
-    """Squeeze-and-Excitation channel attention."""
-    def __init__(self, channels, reduction=8):
-        super().__init__()
-        mid = max(channels // reduction, 4)
-        self.se = torch_nn.Sequential(
-            torch_nn.AdaptiveAvgPool2d(1),
-            torch_nn.Flatten(),
-            torch_nn.Linear(channels, mid),
-            torch_nn.ReLU(inplace=True),
-            torch_nn.Linear(mid, channels),
-            torch_nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        scale = self.se(x).view(x.size(0), x.size(1), 1, 1)
-        return x * scale
-
-
-class ResidualSEBlock(torch_nn.Module):
-    """Conv block with residual skip + SE attention."""
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1):
-        super().__init__()
-        pad = kernel_size // 2
-        self.conv_block = torch_nn.Sequential(
-            torch_nn.Conv2d(in_channels, out_channels, kernel_size, stride, pad),
-            torch_nn.BatchNorm2d(out_channels),
-            torch_nn.GELU(),
-            torch_nn.Conv2d(out_channels, out_channels, kernel_size, 1, pad),
-            torch_nn.BatchNorm2d(out_channels),
-        )
-        self.se = SEBlock(out_channels)
-        self.shortcut = (
-            torch_nn.Sequential(
-                torch_nn.Conv2d(in_channels, out_channels, 1, stride),
-                torch_nn.BatchNorm2d(out_channels)
-            )
-            if in_channels != out_channels or stride != 1
-            else torch_nn.Identity()
-        )
-        self.act = torch_nn.GELU()
-
-    def forward(self, x):
-        out = self.conv_block(x)
-        out = self.se(out)
-        out = out + self.shortcut(x)
-        return self.act(out)
-
-
-class MultiHeadSelfAttention(torch_nn.Module):
-    """Multi-head self-attention for temporal sequence."""
-    def __init__(self, embed_dim, num_heads=4, dropout=0.1):
-        super().__init__()
-        self.attn = torch_nn.MultiheadAttention(
-            embed_dim, num_heads, dropout=dropout, batch_first=True
-        )
-        self.norm = torch_nn.LayerNorm(embed_dim)
-        self.drop = torch_nn.Dropout(dropout)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
         attn_out, _ = self.attn(x, x, x)
         return self.norm(x + self.drop(attn_out))
 
 
-class FrequencyAttentionGate(torch_nn.Module):
-    """
-    Dynamic frequency-wise attention gate.
-    Uses depthwise conv — no fixed Linear layer,
-    so it handles any spatial freq dimension.
-    """
-    def __init__(self, in_channels):
+class FeedForward(nn.Module):
+    def __init__(self, embed_dim, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
-        self.gate = torch_nn.Sequential(
-            torch_nn.AdaptiveAvgPool2d((None, 1)),          # [B, C, F, 1]
-            torch_nn.Conv2d(in_channels, in_channels,
-                            kernel_size=(3, 1), padding=(1, 0),
-                            groups=in_channels),             # depthwise
-            torch_nn.Sigmoid()
+        hidden = int(embed_dim * mlp_ratio)
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, embed_dim),
+            nn.Dropout(dropout),
         )
+        self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
-        # x: [B, C, F, T]
-        w = self.gate(x)    # [B, C, F, 1]
-        return x * w        # broadcast over T
+        return self.norm(x + self.net(x))
 
 
-class LCNN(torch_nn.Module):
-    """
-    Improved LCNN for audio deepfake detection.
-    Improvements: SE blocks, residual connections,
-    multi-head self-attention, frequency attention gate,
-    GELU activations, reduced dropout (0.4).
-    """
-    def __init__(self, **kwargs):
+class ViTBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
-        input_channels   = kwargs.get("input_channels", 3)
-        num_coefficients = kwargs.get("num_coefficients", 80)
-        self.num_coefficients = num_coefficients
-        self.v_emd_dim = 1
+        self.attn = MultiHeadSelfAttention(embed_dim, num_heads, dropout)
+        self.ff   = FeedForward(embed_dim, mlp_ratio, dropout)
 
-        # Stage 1: Initial MFM conv
-        self.stage1 = torch_nn.Sequential(
-            torch_nn.Conv2d(input_channels, 64, (5, 5), 1, padding=(2, 2)),
-            MaxFeatureMap2D(),                  # → 32 ch
-            torch_nn.MaxPool2d((2, 2), (2, 2)),
+    def forward(self, x):
+        x = self.attn(x)
+        x = self.ff(x)
+        return x
+
+
+class ViTAudioEncoder(nn.Module):
+    """
+    ViT-based audio deepfake detector.
+
+    Matches LCNN interface:
+      Input:  (batch, channels, num_coefficients, time_frames)
+      Output: (batch, 1)   — raw logit, apply sigmoid for probability
+
+    Args:
+        input_channels   : number of input channels (default 3, same as LCNN)
+        num_coefficients : frequency bins (default 80, same as LCNN)
+        patch_size       : (freq_patch, time_patch) — controls token count
+        embed_dim        : transformer hidden dimension
+        num_heads        : attention heads (must divide embed_dim)
+        depth            : number of transformer blocks
+        mlp_ratio        : FFN hidden dim multiplier
+        dropout          : dropout probability
+    """
+    def __init__(
+        self,
+        input_channels=3,
+        num_coefficients=80,
+        patch_size=(4, 4),
+        embed_dim=256,
+        num_heads=8,
+        depth=6,
+        mlp_ratio=4.0,
+        dropout=0.1,
+        **kwargs           # absorbs extra kwargs for drop-in compatibility
+    ):
+        super().__init__()
+        self.v_emd_dim = 1   # keep same attribute as LCNN
+
+        # 1. Patch embedding — same role as LCNN's first Conv2d stack
+        self.patch_embed = PatchEmbed(input_channels, patch_size, embed_dim)
+
+        # 2. Learnable [CLS] token + positional embedding (registered as buffer)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # Positional embedding will be sized dynamically on first forward pass
+        self.pos_embed = None
+        self._pos_embed_shape = None
+        self.embed_dim = embed_dim
+
+        # 3. Transformer encoder blocks — replaces LCNN conv stack + BLSTM
+        self.blocks = nn.Sequential(*[
+            ViTBlock(embed_dim, num_heads, mlp_ratio, dropout)
+            for _ in range(depth)
+        ])
+
+        self.norm = nn.LayerNorm(embed_dim)
+
+        # 4. Classification head — same role as LCNN's m_output_act Linear
+        self.head = nn.Linear(embed_dim, 1)
+
+        # Weight init
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None: nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
+
+    def _build_pos_embed(self, num_patches, device):
+        """Build sinusoidal positional embeddings dynamically."""
+        N = num_patches + 1   # +1 for CLS token
+        pe = torch.zeros(1, N, self.embed_dim, device=device)
+        pos = torch.arange(N, dtype=torch.float, device=device).unsqueeze(1)
+        div = torch.exp(
+            torch.arange(0, self.embed_dim, 2, dtype=torch.float, device=device)
+            * -(math.log(10000.0) / self.embed_dim)
         )
-
-        # Stage 2: Residual SE blocks
-        self.stage2 = torch_nn.Sequential(
-            ResidualSEBlock(32, 64),            # → 64 ch
-            MaxFeatureMap2D(),                  # → 32 ch
-            torch_nn.BatchNorm2d(32, affine=False),
-            ResidualSEBlock(32, 96),            # → 96 ch
-            MaxFeatureMap2D(),                  # → 48 ch
-            torch_nn.MaxPool2d((2, 2), (2, 2)),
-            torch_nn.BatchNorm2d(48, affine=False),
-        )
-
-        # Stage 3: Deeper residual SE blocks
-        self.stage3 = torch_nn.Sequential(
-            ResidualSEBlock(48, 96),            # → 96 ch
-            MaxFeatureMap2D(),                  # → 48 ch
-            torch_nn.BatchNorm2d(48, affine=False),
-            ResidualSEBlock(48, 128),           # → 128 ch
-            MaxFeatureMap2D(),                  # → 64 ch
-            torch_nn.MaxPool2d((2, 2), (2, 2)),
-        )
-
-        # Stage 4: Final conv stages
-        self.stage4 = torch_nn.Sequential(
-            ResidualSEBlock(64, 128),           # → 128 ch
-            MaxFeatureMap2D(),                  # → 64 ch
-            torch_nn.BatchNorm2d(64, affine=False),
-            ResidualSEBlock(64, 64),            # → 64 ch
-            MaxFeatureMap2D(),                  # → 32 ch
-            torch_nn.BatchNorm2d(32, affine=False),
-            ResidualSEBlock(32, 64),            # → 64 ch
-            MaxFeatureMap2D(),                  # → 32 ch
-            torch_nn.MaxPool2d((2, 2), (2, 2)),
-            torch_nn.Dropout(0.4),
-        )
-
-        # Frequency attention — in_channels=32 after stage4
-        self.freq_attn = FrequencyAttentionGate(in_channels=32)
-
-        # LSTM input dim: channels * freq_bins after 4 MaxPool2d
-        lstm_input_dim = (num_coefficients // 16) * 32
-
-        # Temporal modeling
-        self.blstm1    = BLSTMLayer(lstm_input_dim, lstm_input_dim)
-        self.self_attn = MultiHeadSelfAttention(lstm_input_dim, num_heads=4)
-        self.blstm2    = BLSTMLayer(lstm_input_dim, lstm_input_dim)
-
-        self.m_output_act = torch_nn.Linear(lstm_input_dim, self.v_emd_dim)
+        pe[0, :, 0::2] = torch.sin(pos * div)
+        pe[0, :, 1::2] = torch.cos(pos * div)
+        return pe
 
     def _compute_embedding(self, x):
-        batch_size = x.shape[0]
+        """Mirrors LCNN's _compute_embedding — same name for compatibility."""
+        B = x.shape[0]
 
-        # [B, C, F, T] → permute to [B, C, T, F]
-        x = x.permute(0, 1, 3, 2)
+        # Patch embedding
+        tokens = self.patch_embed(x)          # (B, N, D)
+        N = tokens.shape[1]
 
-        x = self.stage1(x)
-        x = self.stage2(x)
-        x = self.stage3(x)
-        x = self.stage4(x)
+        # CLS token
+        cls = self.cls_token.expand(B, -1, -1)
+        tokens = torch.cat([cls, tokens], dim=1)   # (B, N+1, D)
 
-        # Frequency attention
-        x = self.freq_attn(x)
+        # Positional embedding (build once, cache shape)
+        if self._pos_embed_shape != N:
+            self.pos_embed = self._build_pos_embed(N, x.device)
+            self._pos_embed_shape = N
+        tokens = tokens + self.pos_embed
 
-        # [B, C, T', F'] → [B, T', C*F']
-        x = x.permute(0, 2, 1, 3).contiguous()
-        frame_num = x.shape[1]
-        x = x.view(batch_size, frame_num, -1)
+        # Transformer blocks
+        tokens = self.blocks(tokens)
+        tokens = self.norm(tokens)
 
-        # Temporal modeling with residual
-        h1 = self.blstm1(x)
-        h1 = self.self_attn(h1)
-        h2 = self.blstm2(h1)
-
-        pooled = (h2 + x).mean(dim=1)
-        return self.m_output_act(pooled)
+        # CLS token → classification head
+        cls_out = tokens[:, 0]                # (B, D)
+        return self.head(cls_out)             # (B, 1)
 
     def _compute_score(self, feature_vec):
+        """Mirrors LCNN's _compute_score."""
         return torch.sigmoid(feature_vec).squeeze(1)
 
     def forward(self, x):
         return self._compute_embedding(x)
 
 
+# ── Quick test ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    model = ImprovedLCNN(input_channels=3, num_coefficients=80)
-    batch_size = 50
-    mock_input = torch.rand((batch_size, 3, 80, 404))
+    model = ViTAudioEncoder(input_channels=3, num_coefficients=80)
+    batch_size = 12
+    mock_input = torch.rand((batch_size, 3, 80, 404))   # identical to LCNN test
     output = model(mock_input)
-    assert output.shape == (batch_size, 1), f"Unexpected shape: {output.shape}"
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"✅ Output shape : {output.shape}")
-    print(f"✅ Total params : {total_params:,}")
+    print("Output shape:", output.shape)   # expect: torch.Size([12, 1])
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {total_params:,}")

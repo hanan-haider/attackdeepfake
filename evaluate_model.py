@@ -1,4 +1,4 @@
-%%writefile /kaggle/working/attackdeepfake/evaluate_models_correct.py
+#%%writefile /kaggle/working/attackdeepfake/evaluate_models_correct.py
 import argparse
 import json
 import logging

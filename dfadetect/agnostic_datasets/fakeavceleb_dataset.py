@@ -32,9 +32,9 @@ FAKEAVCELEB_KFOLD_SPLIT = {
 
 class FakeAVCelebDataset(SimpleAudioFakeDataset):
 
-    audio_folder = "FakeAVCeleb-audio"
-    audio_extension = ".mp3"
-    metadata_file = Path(audio_folder) / "meta_data.csv"
+    audio_folder = "/kaggle/input/datasets/mrquadian/fakeavceleb"
+    audio_extension = ".flac"
+    metadata_file = Path(audio_folder) / "meta_data_selected_methods.csv"
     subsets = ("train", "dev", "eval")
 
     def __init__(self, path, fold_num=0, fold_subset="train", transform=None):
@@ -55,6 +55,7 @@ class FakeAVCelebDataset(SimpleAudioFakeDataset):
         md["audio_type"] = md["type"].apply(lambda x: x.split("-")[-1])
         return md
 
+
     def get_fake_samples(self):
         samples = {
             "user_id": [],
@@ -71,7 +72,7 @@ class FakeAVCelebDataset(SimpleAudioFakeDataset):
 
             for index, sample in fake_samples.iterrows():
                 samples["user_id"].append(sample["source"])
-                samples["sample_name"].append(Path(sample["filename"]).stem)
+                samples["sample_name"].append(Path(sample["path"]).stem)
                 samples["attack_type"].append(sample["method"])
                 samples["label"].append("spoof")
                 samples["path"].append(self.get_file_path(sample))
@@ -95,16 +96,30 @@ class FakeAVCelebDataset(SimpleAudioFakeDataset):
 
         for index, sample in samples_list.iterrows():
             samples["user_id"].append(sample["source"])
-            samples["sample_name"].append(Path(sample["filename"]).stem)
+            samples["sample_name"].append(Path(sample["path"]).stem)
             samples["attack_type"].append("-")
             samples["label"].append("bonafide")
             samples["path"].append(self.get_file_path(sample))
 
         return pd.DataFrame(samples)
 
+
     def get_file_path(self, sample):
-        path = "/".join([self.audio_folder, *sample["path"].split("/")[1:]])
-        return Path(self.path) / path / Path(sample["filename"]).with_suffix(self.audio_extension)
+            """
+            sample['audio_path'] example:
+              'FakeAVCeleb/FakeVideo-FakeAudio/African/men/id00076/00109_10_id00476_wavtolip.flac'
+            We want:
+              '/kaggle/input/datasets/mrquadian/fakeavceleb/FakeVideo-FakeAudio/African/men/id00076/...flac'
+            """
+            rel = sample["audio_path"]
+    
+            # If audio_path starts with 'FakeAVCeleb/', drop that part
+            parts = rel.split("/")
+            if parts[0] == "FakeAVCeleb":
+                rel = "/".join(parts[1:])
+    
+            # Join with base folder
+            return Path(self.audio_folder) / rel
 
 
 if __name__ == "__main__":

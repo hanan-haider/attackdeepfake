@@ -1,192 +1,213 @@
 """
-ViT-based Audio Deepfake Detector
-Drop-in replacement for LCNN baseline.
-Input:  (batch, channels, num_coefficients, time_frames)  — same as LCNN
-Output: (batch, 1) feature vector  → pass through sigmoid for score
+This code is modified version of LCNN baseline
+from ASVSpoof2021 challenge - https://github.com/asvspoof-challenge/2021/blob/main/LA/Baseline-LFCC-LCNN/project/baseline_LA/model.py
 """
+import sys
 
 import torch
-import torch.nn as nn
-import math
+import torch.nn as torch_nn
 
-
-class PatchEmbed(nn.Module):
-    """Split spectrogram into patches and embed them."""
-    def __init__(self, in_channels=3, patch_size=(4, 4), embed_dim=256):
-        super().__init__()
-        self.proj = nn.Conv2d(
-            in_channels, embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size
-        )
-
-    def forward(self, x):
-        # x: (B, C, H, W) → (B, embed_dim, H/ph, W/pw) → (B, N, embed_dim)
-        x = self.proj(x)                      # (B, D, H', W')
-        x = x.flatten(2).transpose(1, 2)      # (B, N, D)
-        return x
-
-
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.1):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(embed_dim)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x):
-        attn_out, _ = self.attn(x, x, x)
-        return self.norm(x + self.drop(attn_out))
-
-
-class FeedForward(nn.Module):
-    def __init__(self, embed_dim, mlp_ratio=4.0, dropout=0.1):
-        super().__init__()
-        hidden = int(embed_dim * mlp_ratio)
-        self.net = nn.Sequential(
-            nn.Linear(embed_dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, embed_dim),
-            nn.Dropout(dropout),
-        )
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x):
-        return self.norm(x + self.net(x))
-
-
-class ViTBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, dropout=0.1):
-        super().__init__()
-        self.attn = MultiHeadSelfAttention(embed_dim, num_heads, dropout)
-        self.ff   = FeedForward(embed_dim, mlp_ratio, dropout)
-
-    def forward(self, x):
-        x = self.attn(x)
-        x = self.ff(x)
-        return x
-
-
-class ViTAudioEncoder(nn.Module):
+# For blstm
+class BLSTMLayer(torch_nn.Module):
+    """ Wrapper over dilated conv1D
+    Input tensor:  (batchsize=1, length, dim_in)
+    Output tensor: (batchsize=1, length, dim_out)
+    We want to keep the length the same
     """
-    ViT-based audio deepfake detector.
-
-    Matches LCNN interface:
-      Input:  (batch, channels, num_coefficients, time_frames)
-      Output: (batch, 1)   — raw logit, apply sigmoid for probability
-
-    Args:
-        input_channels   : number of input channels (default 3, same as LCNN)
-        num_coefficients : frequency bins (default 80, same as LCNN)
-        patch_size       : (freq_patch, time_patch) — controls token count
-        embed_dim        : transformer hidden dimension
-        num_heads        : attention heads (must divide embed_dim)
-        depth            : number of transformer blocks
-        mlp_ratio        : FFN hidden dim multiplier
-        dropout          : dropout probability
-    """
-    def __init__(
-        self,
-        input_channels=3,
-        num_coefficients=80,
-        patch_size=(4, 4),
-        embed_dim=256,
-        num_heads=8,
-        depth=6,
-        mlp_ratio=4.0,
-        dropout=0.1,
-        **kwargs           # absorbs extra kwargs for drop-in compatibility
-    ):
+    def __init__(self, input_dim, output_dim):
         super().__init__()
-        self.v_emd_dim = 1   # keep same attribute as LCNN
-
-        # 1. Patch embedding — same role as LCNN's first Conv2d stack
-        self.patch_embed = PatchEmbed(input_channels, patch_size, embed_dim)
-
-        # 2. Learnable [CLS] token + positional embedding (registered as buffer)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        # Positional embedding will be sized dynamically on first forward pass
-        self.pos_embed = None
-        self._pos_embed_shape = None
-        self.embed_dim = embed_dim
-
-        # 3. Transformer encoder blocks — replaces LCNN conv stack + BLSTM
-        self.blocks = nn.Sequential(*[
-            ViTBlock(embed_dim, num_heads, mlp_ratio, dropout)
-            for _ in range(depth)
-        ])
-
-        self.norm = nn.LayerNorm(embed_dim)
-
-        # 4. Classification head — same role as LCNN's m_output_act Linear
-        self.head = nn.Linear(embed_dim, 1)
-
-        # Weight init
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None: nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
-
-    def _build_pos_embed(self, num_patches, device):
-        """Build sinusoidal positional embeddings dynamically."""
-        N = num_patches + 1   # +1 for CLS token
-        pe = torch.zeros(1, N, self.embed_dim, device=device)
-        pos = torch.arange(N, dtype=torch.float, device=device).unsqueeze(1)
-        div = torch.exp(
-            torch.arange(0, self.embed_dim, 2, dtype=torch.float, device=device)
-            * -(math.log(10000.0) / self.embed_dim)
+        if output_dim % 2 != 0:
+            print("Output_dim of BLSTMLayer is {:d}".format(output_dim))
+            print("BLSTMLayer expects a layer size of even number")
+            sys.exit(1)
+        # bi-directional LSTM
+        self.l_blstm = torch_nn.LSTM(
+            input_dim,
+            output_dim // 2,
+            bidirectional=True
         )
-        pe[0, :, 0::2] = torch.sin(pos * div)
-        pe[0, :, 1::2] = torch.cos(pos * div)
-        return pe
+    def forward(self, x):
+        # permute to (length, batchsize=1, dim)
+        blstm_data, _ = self.l_blstm(x.permute(1, 0, 2))
+        # permute it backt to (batchsize=1, length, dim)
+        return blstm_data.permute(1, 0, 2)
+
+
+class MaxFeatureMap2D(torch_nn.Module):
+    """ Max feature map (along 2D) 
+    
+    MaxFeatureMap2D(max_dim=1)
+    
+    l_conv2d = MaxFeatureMap2D(1)
+    data_in = torch.rand([1, 4, 5, 5])
+    data_out = l_conv2d(data_in)
+
+    
+    Input:
+    ------
+    data_in: tensor of shape (batch, channel, ...)
+    
+    Output:
+    -------
+    data_out: tensor of shape (batch, channel//2, ...)
+    
+    Note
+    ----
+    By default, Max-feature-map is on channel dimension,
+    and maxout is used on (channel ...)
+    """
+    def __init__(self, max_dim = 1):
+        super().__init__()
+        self.max_dim = max_dim
+
+    def forward(self, inputs):
+        # suppose inputs (batchsize, channel, length, dim)
+
+        shape = list(inputs.size())
+
+        if self.max_dim >= len(shape):
+            print("MaxFeatureMap: maximize on %d dim" % (self.max_dim))
+            print("But input has %d dimensions" % (len(shape)))
+            sys.exit(1)
+        if shape[self.max_dim] // 2 * 2 != shape[self.max_dim]:
+            print("MaxFeatureMap: maximize on %d dim" % (self.max_dim))
+            print("But this dimension has an odd number of data")
+            sys.exit(1)
+        shape[self.max_dim] = shape[self.max_dim]//2
+        shape.insert(self.max_dim, 2)
+
+        # view to (batchsize, 2, channel//2, ...)
+        # maximize on the 2nd dim
+        m, i = inputs.view(*shape).max(self.max_dim)
+        return m
+
+
+##############
+## FOR MODEL
+##############
+
+class LCNN(torch_nn.Module):
+    """ Model definition
+    """
+    def __init__(self, **kwargs):
+        super().__init__()
+        input_channels = kwargs.get("input_channels", 3)
+        num_coefficients = kwargs.get("num_coefficients", 80)
+
+        # Working sampling rate
+        self.num_coefficients = num_coefficients
+
+        # dimension of embedding vectors
+        # here, the embedding is just the activation before sigmoid()
+        self.v_emd_dim = 1
+
+        # it can handle models with multiple front-end configuration
+        # by default, only a single front-end
+
+        self.m_transform = torch_nn.Sequential(
+            torch_nn.Conv2d(input_channels, 64, (5, 5), 1, padding=(2, 2)),
+            MaxFeatureMap2D(),
+            torch.nn.MaxPool2d((2, 2), (2, 2)),
+
+            torch_nn.Conv2d(32, 64, (1, 1), 1, padding=(0, 0)),
+            MaxFeatureMap2D(),
+            torch_nn.BatchNorm2d(32, affine=False),
+            torch_nn.Conv2d(32, 96, (3, 3), 1, padding=(1, 1)),
+            MaxFeatureMap2D(),
+
+            torch.nn.MaxPool2d((2, 2), (2, 2)),
+            torch_nn.BatchNorm2d(48, affine=False),
+
+            torch_nn.Conv2d(48, 96, (1, 1), 1, padding=(0, 0)),
+            MaxFeatureMap2D(),
+            torch_nn.BatchNorm2d(48, affine=False),
+            torch_nn.Conv2d(48, 128, (3, 3), 1, padding=(1, 1)),
+            MaxFeatureMap2D(),
+
+            torch.nn.MaxPool2d((2, 2), (2, 2)),
+
+            torch_nn.Conv2d(64, 128, (1, 1), 1, padding=(0, 0)),
+            MaxFeatureMap2D(),
+            torch_nn.BatchNorm2d(64, affine=False),
+            torch_nn.Conv2d(64, 64, (3, 3), 1, padding=(1, 1)),
+            MaxFeatureMap2D(),
+            torch_nn.BatchNorm2d(32, affine=False),
+
+            torch_nn.Conv2d(32, 64, (1, 1), 1, padding=(0, 0)),
+            MaxFeatureMap2D(),
+            torch_nn.BatchNorm2d(32, affine=False),
+            torch_nn.Conv2d(32, 64, (3, 3), 1, padding=(1, 1)),
+            MaxFeatureMap2D(),
+            torch_nn.MaxPool2d((2, 2), (2, 2)),
+
+            torch_nn.Dropout(0.7)
+        )
+
+        self.m_before_pooling = torch_nn.Sequential(
+            BLSTMLayer((self.num_coefficients//16) * 32, (self.num_coefficients//16) * 32),
+            BLSTMLayer((self.num_coefficients//16) * 32, (self.num_coefficients//16) * 32)
+        )
+
+        self.m_output_act = torch_nn.Linear((self.num_coefficients // 16) * 32, self.v_emd_dim)
 
     def _compute_embedding(self, x):
-        """Mirrors LCNN's _compute_embedding — same name for compatibility."""
-        B = x.shape[0]
+        """ definition of forward method 
+        Assume x (batchsize, length, dim)
+        Output x (batchsize * number_filter, output_dim)
+        """
+        # resample if necessary
+        #x = self.m_resampler(x.squeeze(-1)).unsqueeze(-1)
+        
+        # number of sub models
+        batch_size = x.shape[0]
 
-        # Patch embedding
-        tokens = self.patch_embed(x)          # (B, N, D)
-        N = tokens.shape[1]
+        # buffer to store output scores from sub-models
+        output_emb = torch.zeros(
+            [batch_size, self.v_emd_dim],
+            device=x.device,
+            dtype=x.dtype
+        )
 
-        # CLS token
-        cls = self.cls_token.expand(B, -1, -1)
-        tokens = torch.cat([cls, tokens], dim=1)   # (B, N+1, D)
+        # compute scores for each sub-models
+        idx = 0
 
-        # Positional embedding (build once, cache shape)
-        if self._pos_embed_shape != N:
-            self.pos_embed = self._build_pos_embed(N, x.device)
-            self._pos_embed_shape = N
-        tokens = tokens + self.pos_embed
+        # compute scores
+        #  1. unsqueeze to (batch, 1, frame_length, fft_bin)
+        #  2. compute hidden features
+        x = x.permute(0,1,3,2)
+        hidden_features = self.m_transform(x)
 
-        # Transformer blocks
-        tokens = self.blocks(tokens)
-        tokens = self.norm(tokens)
+        #  3. (batch, channel, frame//N, feat_dim//N) ->
+        #     (batch, frame//N, channel * feat_dim//N)
+        #     where N is caused by conv with stride
+        hidden_features = hidden_features.permute(0, 2, 1, 3).contiguous()
+        frame_num = hidden_features.shape[1]
 
-        # CLS token → classification head
-        cls_out = tokens[:, 0]                # (B, D)
-        return self.head(cls_out)             # (B, 1)
+        hidden_features = hidden_features.view(batch_size, frame_num, -1)
+        #  4. pooling
+        #  4. pass through LSTM then summingc
+        hidden_features_lstm = self.m_before_pooling(hidden_features)
+
+        #  5. pass through the output layer
+        tmp_emb = self.m_output_act((hidden_features_lstm + hidden_features).mean(1))
+        output_emb[idx * batch_size : (idx+1) * batch_size] = tmp_emb
+
+        return output_emb
 
     def _compute_score(self, feature_vec):
-        """Mirrors LCNN's _compute_score."""
+        # feature_vec is [batch * submodel, 1]
         return torch.sigmoid(feature_vec).squeeze(1)
 
     def forward(self, x):
-        return self._compute_embedding(x)
+        feature_vec = self._compute_embedding(x)
+
+        return feature_vec
 
 
-# ── Quick test ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    model = ViTAudioEncoder(input_channels=3, num_coefficients=80)
+    print("Definition of model")
+    model = LCNN(input_channels=3, num_coefficients=80)
     batch_size = 12
-    mock_input = torch.rand((batch_size, 3, 80, 404))   # identical to LCNN test
+    mock_input = torch.rand((batch_size, 3, 80, 404))
     output = model(mock_input)
-    print("Output shape:", output.shape)   # expect: torch.Size([12, 1])
-
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {total_params:,}")
+    print(output.shape)

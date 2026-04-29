@@ -10,8 +10,10 @@ def get_model(model_name: str, config: Dict, device:str):
         return raw_net2.RawNet(deepcopy(RAW_NET_CONFIG), device=device)
     elif model_name == "mesonet_inception":
         return mesonet.MesoInception4(num_classes=1, **config)
+    elif model_name == "ViTAudioEncoder":
+        return vitaudioencoder.ViTAudioEncoder(**config)
     elif model_name == "lcnn":
-        return lcnn.ViTAudioEncoder(**config)
+        return lcnn.LCNN(**config)
     elif model_name == "xception":
         return xception.xception(num_classes=1, pretrained=None, **config)
     else:

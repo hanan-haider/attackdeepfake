@@ -2,7 +2,7 @@ import pandas as pd
 
 from dfadetect.agnostic_datasets.asvspoof_dataset import ASVSpoofDataset
 from dfadetect.agnostic_datasets.base_dataset import SimpleAudioFakeDataset
-#from dfadetect.agnostic_datasets.fakeavceleb_dataset import FakeAVCelebDataset
+from dfadetect.agnostic_datasets.fakeavceleb_dataset import FakeAVCelebDataset
 #from dfadetect.agnostic_datasets.wavefake_dataset import WaveFakeDataset
 
 

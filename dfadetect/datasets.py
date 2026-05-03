@@ -131,6 +131,13 @@ class PadDataset(torch.utils.data.Dataset):
 
         return padded_waveform
 
+    @staticmethod
+    def resample(path, target_sample_rate, normalize=True):
+        waveform, sample_rate = torchaudio.sox_effects.apply_effects_file(
+            path, [["rate", f"{target_sample_rate}"]], normalize=normalize)
+
+        return waveform, sample_rate
+
     def __len__(self):
         return len(self.dataset)
 

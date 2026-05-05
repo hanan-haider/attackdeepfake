@@ -109,8 +109,8 @@ def evaluate_nn(
 
         logging_prefix = f"fold_{fold}"
         data_val = AttackAgnosticDataset(
-            #asvspoof_path=datasets_paths[0],
-            wavefake_path=datasets_paths[1],
+            asvspoof_path=datasets_paths[0],
+            #wavefake_path=datasets_paths[1],
             #fakeavceleb_path=datasets_paths[2],
             fold_num=fold,
             fold_subset="val",

@@ -14,6 +14,8 @@ def get_model(model_name: str, config: Dict, device:str):
         return vitaudioencoder.ViTAudioEncoder(**config)
     elif model_name == "lcnn":
         return lcnn.LCNN(**config)
+    elif model_name == "improved_lcnn":
+        return improved.LCNN(**config)
     elif model_name == "xception":
         return xception.xception(num_classes=1, pretrained=None, **config)
     else:

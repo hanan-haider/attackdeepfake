@@ -169,7 +169,7 @@ class FrequencyAttentionGate(nn.Module):
 # Robust LCNN backbone
 # ----------------------
 
-class RobustLCNN(nn.Module):
+class LCNN(nn.Module):
     """
     LCNN variant tuned for cross-dataset robustness.
     Expected input: [B, C_in, F= num_coefficients, T]

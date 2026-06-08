@@ -157,7 +157,7 @@ class BLSTMLayer(torch_nn.Module):
 # Main Model: MobileNetV3-AA  (Attack-Agnostic)
 # ─────────────────────────────────────────────────────────────
 
-class LCNN(torch_nn.Module):
+class MobileNetV3_AA(torch_nn.Module):
     """
     MobileNetV3-style audio deepfake detector.
 

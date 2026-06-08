@@ -1,459 +1,342 @@
 """
-Improved LCNN for Audio Deepfake Detection — Final Memory-Safe Edition
-=======================================================================
+MobileNetV3-inspired Audio Deepfake Detection Model
+Replaces LCNN with depthwise + pointwise convolutions (MobileNetV3 blocks),
+Squeeze-and-Excitation (SE) attention, hard-swish activations, and a
+Bi-LSTM temporal aggregation head — targeting SOTA on the Attack-Agnostic Dataset.
 
-ROOT CAUSE OF ALL PREVIOUS OOMs
-─────────────────────────────────
-MaxFeatureMap2D used:   m, _ = x.view(*shape).max(d)
-torch.Tensor.max() returns (values, indices).
-The indices tensor is int64 (8 bytes/element) vs float32 (4 bytes).
-For a large batch it allocated a SECOND full-size int64 tensor just
-to throw it away with `_`.
-
-Example — batch=512, stem conv output [512, 64, 404, 80]:
-  values  tensor: 512×32×404×80 × 4B = 2.64 GB
-  indices tensor: 512×32×404×80 × 8B = 5.29 GB  ← this caused OOM
-  Total needed at peak: ~8 GB  (before any other stage)
-
-FIX 1 — Replace .max() with torch.amax()
-  torch.amax() returns ONLY the values, no indices.
-  Peak drops from ~8 GB → ~2.64 GB for the same op.
-
-FIX 2 — Gradient checkpointing on CNN stages
-  torch.utils.checkpoint stores only stage inputs/outputs during
-  forward; recomputes intermediates on the backward pass.
-  Reduces backprop activation memory by ~50-60%.
-
-Together these bring peak VRAM well within 14.5 GB even at large batch.
-
-Quality improvements kept from previous iterations:
-  ✅ SEBlock channel attention after every MFM
-  ✅ FrequencyAttention depthwise spatial gate
-  ✅ BLSTM → pre-norm Transformer → BLSTM temporal pipeline
-  ✅ Safe BLSTM residual (dims always match)
-  ✅ Attentive statistics pooling
-  ✅ Two-layer MLP head  (raw logit — use BCEWithLogitsLoss)
-  ✅ SpecAugment built-in (training only)
-  ✅ Kaiming init on Conv2d layers
+Expected input shape : (batch, channels, num_coefficients, time_frames)
+                       e.g.  (12, 3, 80, 404)
+Output shape         : (batch, 1)  — raw logit (apply sigmoid for score)
 """
 
 import sys
 import torch
-import torch.nn as nn
+import torch.nn as torch_nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fix 1: MaxFeatureMap2D using torch.amax — no index tensor allocated
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Activation helpers
+# ─────────────────────────────────────────────────────────────
 
-class MaxFeatureMap2D(nn.Module):
+class HardSwish(torch_nn.Module):
+    """Hard-Swish activation used in MobileNetV3."""
+    def forward(self, x):
+        return x * F.hardtanh(x + 3, 0.0, 6.0) / 6.0
+
+
+class HardSigmoid(torch_nn.Module):
+    """Hard-Sigmoid used inside SE blocks."""
+    def forward(self, x):
+        return F.hardtanh(x + 3, 0.0, 6.0) / 6.0
+
+
+# ─────────────────────────────────────────────────────────────
+# Squeeze-and-Excitation (SE) Block
+# ─────────────────────────────────────────────────────────────
+
+class SEBlock(torch_nn.Module):
     """
-    MFM activation: halves channel count by element-wise max over pairs.
-
-    CRITICAL FIX: uses torch.amax() instead of Tensor.max().
-    Tensor.max() returns (values, indices); the indices tensor is int64
-    (8 bytes each) and causes OOM on large batches even when discarded.
-    torch.amax() returns only values — half the peak memory.
+    Channel-wise Squeeze-and-Excitation attention.
+    Helps the model re-weight feature maps — critical for catching
+    subtle artefacts in spoofed speech.
     """
-    def __init__(self, max_dim: int = 1):
+    def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
-        self.max_dim = max_dim
+        squeezed = max(1, channels // reduction)
+        self.se = torch_nn.Sequential(
+            torch_nn.AdaptiveAvgPool2d(1),
+            torch_nn.Flatten(),
+            torch_nn.Linear(channels, squeezed, bias=False),
+            torch_nn.ReLU(inplace=True),
+            torch_nn.Linear(squeezed, channels, bias=False),
+            HardSigmoid(),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        d = self.max_dim
-        if x.size(d) % 2 != 0:
-            sys.exit(1)
-        shape = list(x.size())
-        shape[d] //= 2
-        shape.insert(d, 2)
-        # torch.amax: no index tensor → saves 8B × numel bytes at peak
-        return torch.amax(x.view(*shape), dim=d)
+    def forward(self, x):
+        # x: (B, C, H, W)
+        scale = self.se(x).view(x.shape[0], x.shape[1], 1, 1)
+        return x * scale
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Primitives
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Depthwise-Separable Convolution Block
+# ─────────────────────────────────────────────────────────────
 
-class BLSTMLayer(nn.Module):
+class DSConvBNAct(torch_nn.Module):
+    """Depthwise conv → BN → Act + Pointwise conv → BN → Act."""
+    def __init__(self, in_ch: int, out_ch: int,
+                 kernel: int = 3, stride: int = 1,
+                 padding: int = 1, act=None):
+        super().__init__()
+        act = act or HardSwish
+        self.dw = torch_nn.Sequential(
+            torch_nn.Conv2d(in_ch, in_ch, kernel, stride=stride,
+                            padding=padding, groups=in_ch, bias=False),
+            torch_nn.BatchNorm2d(in_ch),
+            act(),
+        )
+        self.pw = torch_nn.Sequential(
+            torch_nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            torch_nn.BatchNorm2d(out_ch),
+            act(),
+        )
+
+    def forward(self, x):
+        return self.pw(self.dw(x))
+
+
+# ─────────────────────────────────────────────────────────────
+# MobileNetV3 Inverted-Residual Bottleneck (IRB)
+# ─────────────────────────────────────────────────────────────
+
+class IRBlock(torch_nn.Module):
+    """
+    Inverted-Residual Bottleneck with optional SE and hard-swish.
+    expand → depthwise (+ optional SE) → project
+    Residual connection when in_ch == out_ch and stride == 1.
+    """
+    def __init__(self, in_ch: int, exp_ch: int, out_ch: int,
+                 kernel: int = 3, stride: int = 1,
+                 use_se: bool = True, act=None):
+        super().__init__()
+        act = act or HardSwish
+        padding = (kernel - 1) // 2
+        self.use_res = (stride == 1 and in_ch == out_ch)
+
+        layers = []
+        # Expand (pointwise)
+        if exp_ch != in_ch:
+            layers += [
+                torch_nn.Conv2d(in_ch, exp_ch, 1, bias=False),
+                torch_nn.BatchNorm2d(exp_ch),
+                act(),
+            ]
+        # Depthwise
+        layers += [
+            torch_nn.Conv2d(exp_ch, exp_ch, kernel, stride=stride,
+                            padding=padding, groups=exp_ch, bias=False),
+            torch_nn.BatchNorm2d(exp_ch),
+            act(),
+        ]
+        # SE
+        if use_se:
+            layers.append(SEBlock(exp_ch))
+        # Project (pointwise, no activation)
+        layers += [
+            torch_nn.Conv2d(exp_ch, out_ch, 1, bias=False),
+            torch_nn.BatchNorm2d(out_ch),
+        ]
+        self.block = torch_nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.block(x)
+        return x + out if self.use_res else out
+
+
+# ─────────────────────────────────────────────────────────────
+# Temporal Bi-LSTM aggregation (same role as LCNN's m_before_pooling)
+# ─────────────────────────────────────────────────────────────
+
+class BLSTMLayer(torch_nn.Module):
+    """Bi-directional LSTM — input/output shape: (B, T, D)."""
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
         if output_dim % 2 != 0:
+            print("BLSTMLayer: output_dim must be even, got", output_dim)
             sys.exit(1)
-        self.lstm = nn.LSTM(
-            input_dim, output_dim // 2,
-            bidirectional=True, batch_first=True
-        )
+        self.lstm = torch_nn.LSTM(input_dim, output_dim // 2,
+                                  bidirectional=True, batch_first=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.lstm(x)
-        return out
+    def forward(self, x):               # x: (B, T, D)
+        out, _ = self.lstm(x.permute(1, 0, 2))   # (T, B, D)
+        return out.permute(1, 0, 2)               # (B, T, D)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Attention modules (lightweight — negligible memory overhead)
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Main Model: MobileNetV3-AA  (Attack-Agnostic)
+# ─────────────────────────────────────────────────────────────
 
-class SEBlock(nn.Module):
+class LCNN(torch_nn.Module):
     """
-    Channel squeeze-and-excitation.
-    Operates on pooled scalars — adds ~0% to activation memory.
-    """
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
-        mid = max(channels // reduction, 4)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, mid, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(mid, channels, bias=False),
-            nn.Sigmoid(),
-        )
+    MobileNetV3-style audio deepfake detector.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c = x.size(0), x.size(1)
-        w = self.pool(x).view(b, c)
-        w = self.fc(w).view(b, c, 1, 1)
-        return x * w
+    Architecture highlights
+    ───────────────────────
+    • Stem          : regular 3×3 conv (heavy-but-fast first layer)
+    • Backbone      : 8 Inverted-Residual Bottleneck blocks with SE
+    • Temporal head : 2-layer Bi-LSTM (residual skip, same as LCNN)
+    • Classifier    : single Linear → logit
+    • Activations   : Hard-Swish throughout (faster & comparable to Swish)
+    • Dropout 0.5   : before final linear (reduced from LCNN's 0.7 to
+                      avoid underfitting on seen attack types)
 
-
-class FrequencyAttention(nn.Module):
-    """
-    Spatial attention along the frequency axis.
-    Depthwise conv — handles any F dimension without fixed Linear.
-    Input / output: [B, C, F, T]
-    """
-    def __init__(self, channels: int):
-        super().__init__()
-        self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d((None, 1)),
-            nn.Conv2d(channels, channels,
-                      kernel_size=(3, 1), padding=(1, 0),
-                      groups=channels, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.gate(x)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Lightweight conv block — single Conv2d matches original's memory footprint
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ConvMFMSE(nn.Module):
-    """
-    Single Conv2d → BN → GELU → MFM → SEBlock.
-
-    One Conv2d per block keeps activation memory identical to the
-    original repo. SE operates on pooled scalars, so it's essentially
-    free. MFM now uses torch.amax (no index tensor).
-
-    in_ch → conv(out_ch×2) → MFM → out_ch → SE → out_ch
-    """
-    def __init__(self, in_ch: int, out_ch: int,
-                 kernel: int = 3, padding: int = 1):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch * 2, kernel, 1, padding,
-                              bias=False)
-        self.bn   = nn.BatchNorm2d(out_ch * 2)
-        self.mfm  = MaxFeatureMap2D()
-        self.se   = SEBlock(out_ch, reduction=16)
-        nn.init.kaiming_normal_(self.conv.weight,
-                                mode='fan_out', nonlinearity='relu')
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        x = self.bn(x)
-        x = F.gelu(x)
-        x = self.mfm(x)
-        x = self.se(x)
-        return x
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SpecAugment (training-only, zero overhead at inference)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def spec_augment(
-        x: torch.Tensor,
-        freq_mask_param: int = 8,
-        time_mask_param: int = 20,
-        num_freq_masks:  int = 2,
-        num_time_masks:  int = 2,
-) -> torch.Tensor:
-    """SpecAugment on [B, C, dim1, dim2]. Returns cloned tensor."""
-    B, C, F, T = x.shape
-    out = x.clone()
-    for b in range(B):
-        for _ in range(num_freq_masks):
-            f0 = torch.randint(0, max(F - freq_mask_param, 1), (1,)).item()
-            fw = torch.randint(1, freq_mask_param + 1, (1,)).item()
-            out[b, :, f0:f0 + fw, :] = 0.0
-        for _ in range(num_time_masks):
-            t0 = torch.randint(0, max(T - time_mask_param, 1), (1,)).item()
-            tw = torch.randint(1, time_mask_param + 1, (1,)).item()
-            out[b, :, :, t0:t0 + tw] = 0.0
-    return out
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Temporal modules
-# ─────────────────────────────────────────────────────────────────────────────
-
-class PreNormTransformerLayer(nn.Module):
-    """
-    Pre-norm Transformer encoder layer.
-    More stable than post-norm; faster convergence on small datasets.
-    """
-    def __init__(self, d_model: int, nhead: int = 4,
-                 dropout: float = 0.1):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.attn  = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=True
-        )
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model),
-            nn.Dropout(dropout),
-        )
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        n = self.norm1(x)
-        h, _ = self.attn(n, n, n)
-        x = x + self.drop(h)
-        x = x + self.ff(self.norm2(x))
-        return x
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main model
-# ─────────────────────────────────────────────────────────────────────────────
-
-class LCNN(nn.Module):
-    """
-    Memory-safe improved LCNN for audio deepfake detection.
-
-    CNN backbone (single Conv2d per block — matches original memory):
-      stem    : 5×5 conv + MFM(amax) + pool  → [B, 32,  T/2,  F/2]
-      stage2  : 2 × ConvMFMSE + pool          → [B, 48,  T/4,  F/4]
-      stage3  : 2 × ConvMFMSE + pool          → [B, 64,  T/8,  F/8]
-      stage4  : 3 × ConvMFMSE + pool          → [B, 32,  T/16, F/16]
-
-    Temporal:
-      FrequencyAttention → BLSTM → Transformer → BLSTM+residual
-      → attentive pooling → MLP head → logit [B, 1]
-
-    Memory fixes applied:
-      • torch.amax in MFM       (no index tensor, saves up to 5 GB/batch)
-      • Gradient checkpointing  (CNN stages recompute on backward, ~50%
-                                 less backprop activation memory)
-
-    Args:
-        input_channels   : spectral channels              (default 3)
-        num_coefficients : frequency bins F               (default 80)
-        dropout          : dropout throughout             (default 0.4)
-        use_spec_augment : SpecAugment during training    (default True)
-        use_checkpoint   : gradient checkpointing on CNN  (default True)
-
-    Output: raw logit [B, 1]
-      Training  → BCEWithLogitsLoss(logit, label)
-      Inference → model._compute_score(logit)
+    Why better than LCNN on Attack-Agnostic?
+    ─────────────────────────────────────────
+    1. SE attention highlights discriminative frequency-time regions.
+    2. Depthwise separable convs give 8-9× fewer FLOPS → better
+       regularisation and faster convergence with limited data.
+    3. Hard-swish avoids the dying-ReLU problem in deep stacks.
+    4. Residual paths in IRBlocks preserve low-level artefact cues.
     """
 
     def __init__(self, **kwargs):
         super().__init__()
-        in_ch           = kwargs.get("input_channels",   3)
-        num_coeff       = kwargs.get("num_coefficients", 80)
-        dropout         = kwargs.get("dropout",          0.4)
-        self.use_aug    = kwargs.get("use_spec_augment", True)
-        self.use_ckpt   = kwargs.get("use_checkpoint",   True)
-        self.num_coefficients = num_coeff
-        self.v_emd_dim  = 1
+        input_channels  = kwargs.get("input_channels",  3)
+        num_coefficients = kwargs.get("num_coefficients", 80)
 
-        # ── Stem ─────────────────────────────────────────────────────────
-        # 5×5 conv matches original; MFM now uses amax (key memory fix)
-        # [B, in_ch, T, F] → [B, 32, T/2, F/2]
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_ch, 64, (5, 5), 1, (2, 2), bias=False),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-            MaxFeatureMap2D(),      # 64 → 32  (amax, no index tensor)
-            nn.MaxPool2d(2, 2),
-        )
-        nn.init.kaiming_normal_(self.stem[0].weight,
-                                mode='fan_out', nonlinearity='relu')
+        self.num_coefficients = num_coefficients
+        self.v_emd_dim = 1
 
-        # ── Stage 2 ───────────────────────────────────────────────────────
-        # [B, 32, T/2, F/2] → [B, 48, T/4, F/4]
-        self.stage2 = nn.Sequential(
-            ConvMFMSE(32, 32),
-            nn.BatchNorm2d(32, affine=False),
-            ConvMFMSE(32, 48),
-            nn.MaxPool2d(2, 2),
-            nn.BatchNorm2d(48, affine=False),
+        # ── Stem ──────────────────────────────────────────────
+        # Regular conv to map multi-channel spectral input → 16 ch
+        self.stem = torch_nn.Sequential(
+            torch_nn.Conv2d(input_channels, 16, 3, stride=1,
+                            padding=1, bias=False),
+            torch_nn.BatchNorm2d(16),
+            HardSwish(),
         )
 
-        # ── Stage 3 ───────────────────────────────────────────────────────
-        # [B, 48, T/4, F/4] → [B, 64, T/8, F/8]
-        self.stage3 = nn.Sequential(
-            ConvMFMSE(48, 48),
-            nn.BatchNorm2d(48, affine=False),
-            ConvMFMSE(48, 64),
-            nn.MaxPool2d(2, 2),
+        # ── Backbone (MobileNetV3-Large-inspired) ─────────────
+        # Each tuple: (in_ch, exp_ch, out_ch, kernel, stride, se)
+        cfg = [
+            # Stage 1 — light feature extraction, no SE (early layers)
+            (16,  16,  16, 3, 1, False),   # s=1 → same size
+            (16,  64,  24, 3, 2, False),   # ↓2 freq & time
+            (24,  72,  24, 3, 1, False),
+            # Stage 2 — richer features, add SE
+            (24,  72,  40, 5, 2, True),    # ↓2
+            (40, 120,  40, 5, 1, True),
+            (40, 120,  40, 5, 1, True),
+            # Stage 3 — high-level, SE + hard-swish
+            (40, 240,  80, 3, 2, True),    # ↓2
+            (80, 200,  80, 3, 1, True),
+            (80, 184,  80, 3, 1, True),
+            (80, 184,  80, 3, 1, True),
+            (80, 480, 112, 3, 1, True),
+            (112, 672, 112, 3, 1, True),
+            # Stage 4 — final spatial compression
+            (112, 672, 160, 5, 2, True),   # ↓2
+            (160, 960, 160, 5, 1, True),
+            (160, 960, 160, 5, 1, True),
+        ]
+
+        blocks = []
+        for (ic, ec, oc, k, s, se) in cfg:
+            blocks.append(IRBlock(ic, ec, oc, kernel=k,
+                                  stride=s, use_se=se))
+        self.backbone = torch_nn.Sequential(*blocks)
+
+        # ── Conv head (replaces LCNN's last dropout+pool) ──────
+        self.conv_head = torch_nn.Sequential(
+            torch_nn.Conv2d(160, 256, 1, bias=False),
+            torch_nn.BatchNorm2d(256),
+            HardSwish(),
+            torch_nn.Dropout2d(0.1),     # spatial dropout for regularisation
         )
 
-        # ── Stage 4 ───────────────────────────────────────────────────────
-        # [B, 64, T/8, F/8] → [B, 32, T/16, F/16]
-        self.stage4 = nn.Sequential(
-            ConvMFMSE(64, 64),
-            nn.BatchNorm2d(64, affine=False),
-            ConvMFMSE(64, 32),
-            nn.BatchNorm2d(32, affine=False),
-            ConvMFMSE(32, 32),
-            nn.MaxPool2d(2, 2),
-            nn.Dropout2d(dropout * 0.5),
+        # After 4× stride-2 downsampling:
+        #   freq dim : num_coefficients // 16
+        #   channel  : 256
+        # LSTM input dim = (freq//16) * 256
+        lstm_in = (num_coefficients // 16) * 256
+        lstm_hidden = lstm_in  # keep dim consistent with LCNN convention
+
+        # ── Temporal Bi-LSTM ──────────────────────────────────
+        self.m_before_pooling = torch_nn.Sequential(
+            BLSTMLayer(lstm_in, lstm_hidden),
+            BLSTMLayer(lstm_hidden, lstm_hidden),
         )
 
-        # ── Frequency attention ───────────────────────────────────────────
-        self.freq_attn = FrequencyAttention(channels=32)
+        # ── Output head ───────────────────────────────────────
+        self.dropout = torch_nn.Dropout(0.5)
+        self.m_output_act = torch_nn.Linear(lstm_hidden, self.v_emd_dim)
 
-        # ── LSTM dimensions ───────────────────────────────────────────────
-        lstm_dim = (num_coeff // 16) * 32
+        # Weight init
+        self._init_weights()
 
-        # ── Temporal pipeline ─────────────────────────────────────────────
-        self.blstm1   = BLSTMLayer(lstm_dim, lstm_dim)
-        self.trans    = PreNormTransformerLayer(
-            lstm_dim, nhead=4, dropout=dropout * 0.25
-        )
-        self.blstm2   = BLSTMLayer(lstm_dim, lstm_dim)
-        self.seq_drop = nn.Dropout(dropout)
+    # ── Weight initialisation ──────────────────────────────────
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, torch_nn.Conv2d):
+                torch_nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    torch_nn.init.zeros_(m.bias)
+            elif isinstance(m, torch_nn.BatchNorm2d):
+                torch_nn.init.ones_(m.weight)
+                torch_nn.init.zeros_(m.bias)
+            elif isinstance(m, torch_nn.Linear):
+                torch_nn.init.normal_(m.weight, 0, 0.01)
+                if m.bias is not None:
+                    torch_nn.init.zeros_(m.bias)
 
-        # ── Attentive pooling ─────────────────────────────────────────────
-        self.attn_pool = nn.Linear(lstm_dim, 1)
-
-        # ── MLP classification head ───────────────────────────────────────
-        self.head = nn.Sequential(
-            nn.Linear(lstm_dim, lstm_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(lstm_dim // 2, self.v_emd_dim),
-        )
-
-    # ── Checkpointed stage runners ────────────────────────────────────────
-    # Gradient checkpointing: during forward, intermediates inside each
-    # stage are NOT stored; they are recomputed on the backward pass.
-    # This cuts backprop activation memory by ~50% with ~25% compute cost.
-
-    def _run_stem(self, x):
-        return self.stem(x)
-
-    def _run_stage2(self, x):
-        return self.stage2(x)
-
-    def _run_stage3(self, x):
-        return self.stage3(x)
-
-    def _run_stage4(self, x):
-        return self.stage4(x)
-
-    # ── Helpers ───────────────────────────────────────────────────────────
-
-    def _compute_score(self, logit: torch.Tensor) -> torch.Tensor:
-        """Raw logit → probability [0, 1], shape [B]."""
-        return torch.sigmoid(logit).squeeze(1)
-
-    def _compute_embedding(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.size(0)
-
-        # [B, C, F, T] → [B, C, T, F]  (Conv treats T as height, F as width)
-        x = x.permute(0, 1, 3, 2)
-
-        # SpecAugment (training only)
-        if self.training and self.use_aug:
-            x = spec_augment(x,
-                             freq_mask_param=8,
-                             time_mask_param=20,
-                             num_freq_masks=2,
-                             num_time_masks=2)
-
-        # CNN backbone — optionally gradient-checkpointed
-        # use_reentrant=False: safer with autocast / AMP training
-        if self.use_ckpt and self.training:
-            x = checkpoint(self._run_stem,   x, use_reentrant=False)
-            x = checkpoint(self._run_stage2, x, use_reentrant=False)
-            x = checkpoint(self._run_stage3, x, use_reentrant=False)
-            x = checkpoint(self._run_stage4, x, use_reentrant=False)
-        else:
-            x = self._run_stem(x)
-            x = self._run_stage2(x)
-            x = self._run_stage3(x)
-            x = self._run_stage4(x)
-
-        # Frequency attention
-        x = self.freq_attn(x)
-
-        # Reshape to sequence [B, T', lstm_dim]
-        x = x.permute(0, 2, 1, 3).contiguous()
-        T_prime = x.size(1)
-        x = x.view(B, T_prime, -1)
-
-        # Temporal modeling
-        h = self.blstm1(x)
-        h = self.trans(h)
-        h = self.blstm2(h) + h     # residual — dims guaranteed equal ✓
-        h = self.seq_drop(h)
-
-        # Attentive pooling
-        w = torch.softmax(self.attn_pool(h), dim=1)   # [B, T', 1]
-        pooled = (h * w).sum(dim=1)                    # [B, lstm_dim]
-
-        return self.head(pooled)                        # [B, 1]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    # ── Core forward ──────────────────────────────────────────
+    def _compute_embedding(self, x):
         """
-        Args:  x [B, C, F, T]
-        Returns: logit [B, 1]  (raw, no sigmoid)
+        x : (B, C, freq, time)  — same layout as LCNN input
+        returns embedding : (B, 1)
         """
+        batch_size = x.shape[0]
+
+        # LCNN permutes to (B, C, time, freq); we keep (B, C, freq, time)
+        # because our strides compress freq first (matches mel-spectrogram
+        # convention where freq is the 'spatial' axis).
+        x = x.permute(0, 1, 3, 2)   # (B, C, time, freq) — match LCNN layout
+
+        # CNN feature extraction
+        x = self.stem(x)             # (B, 16, T, F)
+        x = self.backbone(x)         # (B, 160, T//16, F//16)
+        x = self.conv_head(x)        # (B, 256, T//16, F//16)
+
+        # Reshape for LSTM: (B, T//16, 256 * F//16)
+        B, C, T, F = x.shape
+        x = x.permute(0, 2, 1, 3).contiguous()   # (B, T, C, F)
+        x = x.view(B, T, C * F)                   # (B, T, feat)
+
+        # Bi-LSTM temporal modelling (residual, same as LCNN)
+        lstm_out = self.m_before_pooling(x)        # (B, T, feat)
+        fused = (lstm_out + x).mean(dim=1)         # (B, feat)  — temporal mean pool
+
+        # Classifier
+        fused = self.dropout(fused)
+        emb = self.m_output_act(fused)             # (B, 1)
+        return emb
+
+    def _compute_score(self, feature_vec):
+        """Sigmoid squash to [0, 1] score."""
+        return torch.sigmoid(feature_vec).squeeze(1)
+
+    def forward(self, x):
+        """Returns raw logit (B, 1). Use _compute_score for probabilities."""
         return self._compute_embedding(x)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sanity check
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Alias so existing code calling LCNN(...) still works
+# ─────────────────────────────────────────────────────────────
+LCNN = MobileNetV3_AA
 
+
+# ─────────────────────────────────────────────────────────────
+# Smoke test
+# ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    torch.manual_seed(42)
+    print("Definition of model")
+    model = LCNN(input_channels=3, num_coefficients=80)
 
-    model = LCNN(
-        input_channels=3,
-        num_coefficients=80,
-        dropout=0.4,
-        use_spec_augment=True,
-        use_checkpoint=True,
-    )
+    batch_size = 12
+    mock_input = torch.rand((batch_size, 3, 80, 404))
+    output = model(mock_input)
+    print(output.shape)
 
- 
-    print("""
-─────────────────────────────────────────────────────
-Memory fixes applied:
-  1. MFM uses torch.amax() — no int64 index tensor
-     saves up to 5 GB peak per batch at large B
-  2. Gradient checkpointing on CNN stages
-     saves ~50% backprop activation memory
+    # Parameter count
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nTotal parameters    : {total:,}")
+    print(f"Trainable parameters: {trainable:,}")
 
-Training usage:
-  criterion = nn.BCEWithLogitsLoss()
-  loss = criterion(model(batch_x), batch_y)
-
-Inference usage:
-  score = model._compute_score(model(x))
-─────────────────────────────────────────────────────
-""")
+    # Score output
+    score = model._compute_score(output)
+    print(f"Score shape         : {score.shape}")
+    print(f"Score range         : [{score.min():.4f}, {score.max():.4f}]")

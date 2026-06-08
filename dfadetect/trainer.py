@@ -96,6 +96,10 @@ class GDTrainer(Trainer):
         criterion = torch.nn.BCEWithLogitsLoss()
         optim = self.optimizer_fn(model.parameters(), **self.optimizer_kwargs)
 
+
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=3e-4, epochs=30, steps_per_epoch=len(train_loader)
+        )
         best_model = None
         best_acc = 0
 

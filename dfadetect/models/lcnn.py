@@ -1,7 +1,8 @@
 """
 MobileNetV3-inspired Audio Deepfake Detection Model
 ===================================================
-Memory-Safe Edition with Gradient Checkpointing & Frequency Pooling.
+Memory-Safe Edition with Gradient Checkpointing, Frequency Pooling, 
+and Native In-Place Activations.
 
 Expected input shape : (batch, channels, num_coefficients, time_frames)
                        e.g.  (12, 3, 80, 404)
@@ -14,18 +15,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
-
 # ─────────────────────────────────────────────────────────────
-# Activation & Attention Helpers
+# Squeeze-and-Excitation (SE) Block
 # ─────────────────────────────────────────────────────────────
-
-class HardSwish(nn.Module):
-    def forward(self, x):
-        return x * F.hardtanh(x + 3, 0.0, 6.0) / 6.0
-
-class HardSigmoid(nn.Module):
-    def forward(self, x):
-        return F.hardtanh(x + 3, 0.0, 6.0) / 6.0
 
 class SEBlock(nn.Module):
     """Channel-wise Squeeze-and-Excitation attention."""
@@ -36,9 +28,9 @@ class SEBlock(nn.Module):
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(channels, squeezed, bias=False),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=True), # Memory Fix: inplace=True
             nn.Linear(squeezed, channels, bias=False),
-            HardSigmoid(),
+            nn.Hardsigmoid(inplace=True), # Memory Fix: Native In-Place
         )
 
     def forward(self, x):
@@ -59,7 +51,8 @@ class IRBlock(nn.Module):
                  kernel: int = 3, stride: int = 1,
                  use_se: bool = True, act=None):
         super().__init__()
-        act = act or HardSwish
+        # Memory Fix: Default to Native In-Place Hardswish
+        act = act or nn.Hardswish(inplace=True) 
         padding = (kernel - 1) // 2
         self.use_res = (stride == 1 and in_ch == out_ch)
 
@@ -69,14 +62,14 @@ class IRBlock(nn.Module):
             layers += [
                 nn.Conv2d(in_ch, exp_ch, 1, bias=False),
                 nn.BatchNorm2d(exp_ch),
-                act(),
+                act,
             ]
         # Depthwise
         layers += [
             nn.Conv2d(exp_ch, exp_ch, kernel, stride=stride,
                       padding=padding, groups=exp_ch, bias=False),
             nn.BatchNorm2d(exp_ch),
-            act(),
+            act,
         ]
         # Squeeze-and-Excitation
         if use_se:
@@ -106,14 +99,14 @@ class LCNN(nn.Module):
         super().__init__()
         input_channels  = kwargs.get("input_channels", 3)
         self.num_coefficients = kwargs.get("num_coefficients", 80)
-        self.use_ckpt = kwargs.get("use_checkpoint", True) # Default to True for memory safety
+        self.use_ckpt = kwargs.get("use_checkpoint", True) # Default to True
         self.v_emd_dim = 1
 
         # ── Stem ──
         self.stem = nn.Sequential(
             nn.Conv2d(input_channels, 16, 3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(16),
-            HardSwish(),
+            nn.Hardswish(inplace=True), # Memory Fix: Native In-Place
         )
 
         # ── Backbone Configuration ──
@@ -153,12 +146,11 @@ class LCNN(nn.Module):
         self.conv_head = nn.Sequential(
             nn.Conv2d(160, 256, 1, bias=False),
             nn.BatchNorm2d(256),
-            HardSwish(),
+            nn.Hardswish(inplace=True), # Memory Fix: Native In-Place
             nn.Dropout2d(0.1),
         )
 
         # ── Temporal Bi-LSTM ──
-        # Input is now fixed at 256 due to frequency pooling
         self.lstm = nn.LSTM(input_size=256, hidden_size=128, 
                             num_layers=2, bidirectional=True, batch_first=True)
 
@@ -189,7 +181,6 @@ class LCNN(nn.Module):
         x : (B, C, freq, time)
         returns logit : (B, 1)
         """
-        # (B, C, time, freq) matches legacy spatial dimension handling
         x = x.permute(0, 1, 3, 2) 
 
         # Stem
@@ -210,9 +201,7 @@ class LCNN(nn.Module):
         # Conv Head
         x = self.conv_head(x)  # Shape: (B, 256, T//16, F//16)
 
-        # ── Frequency Pooling (Crucial Memory Fix for LSTM) ──
-        # Averages out the remaining Frequency bins. 
-        # Dimension 3 is freq because of the permute at the start.
+        # Frequency Pooling 
         x = x.mean(dim=3)      # Shape: (B, 256, T//16)
         
         # Prepare for LSTM (Batch First)
@@ -238,10 +227,8 @@ class LCNN(nn.Module):
 if __name__ == "__main__":
     print("Definition of model")
     
-    # Passing use_checkpoint=True prevents VRAM explosion on large batches
     model = LCNN(input_channels=3, num_coefficients=80, use_checkpoint=True)
     
-    # Simulated large audio tensor
     batch_size = 12
     mock_input = torch.rand((batch_size, 3, 80, 404))
     

@@ -26,6 +26,7 @@ MFCC_FN = torchaudio.transforms.MFCC(
         "n_fft": 512,
         "win_length": win_length,
         "hop_length": hop_length,
+        "n_mels": 80,  # <-- ADD THIS LINE
     },
 ).to(device)
 

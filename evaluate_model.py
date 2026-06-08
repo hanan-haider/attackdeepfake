@@ -240,81 +240,6 @@ def evaluate_nn(
         plt.show()
         print(f"  📈 ROC curve saved → roc_curve_fold_{fold}.png")
 
-
-def evaluate_gmm(
-    real_model_path: str,
-    fake_model_path: str,
-    datasets_paths: List[str],
-    amount_to_use: Optional[int],
-    feature_fn: Callable,
-    feature_kwargs: dict,
-    clusters: int,
-    device: str,
-    frontend: str,
-    output_file_name: str,
-    use_double_delta: bool = True
-):
-    complete_results = {}
-    LOGGER.info(f"paths: {real_model_path}, {fake_model_path}, {datasets_paths}")
-
-    for subtype in ["val", "test", "train"]:
-        for fold in [0, 1, 2]:
-            real_dataset_test = AttackAgnosticDataset(
-                asvspoof_path=datasets_paths[0],
-                wavefake_path=datasets_paths[1],
-                fakeavceleb_path=datasets_paths[2],
-                fold_num=fold, fold_subset=subtype,
-                oversample=False, undersample=False,
-                return_label=False, reduced_number=amount_to_use,
-            )
-            real_dataset_test.get_bonafide_only()
-
-            fake_dataset_test = AttackAgnosticDataset(
-                asvspoof_path=datasets_paths[0],
-                wavefake_path=datasets_paths[1],
-                fakeavceleb_path=datasets_paths[2],
-                fold_num=fold, fold_subset=subtype,
-                oversample=False, undersample=False,
-                return_label=False, reduced_number=amount_to_use,
-            )
-            fake_dataset_test.get_spoof_only()
-
-            real_dataset_test, fake_dataset_test = apply_feature_and_double_delta(
-                [real_dataset_test, fake_dataset_test],
-                feature_fn=feature_fn,
-                feature_kwargs=feature_kwargs,
-                use_double_delta=use_double_delta
-            )
-
-            model_path  = Path(real_model_path) / f"real_{fold}" / "ckpt.pth"
-            real_model  = load_model(real_dataset_test, str(model_path), device, clusters)
-
-            model_path  = Path(fake_model_path) / f"fake_{fold}" / "ckpt.pth"
-            fake_model  = load_model(fake_dataset_test, str(model_path), device, clusters)
-
-            plot_path = Path(f"plots/{frontend}/fold_{fold}/{subtype}")
-            plot_path.mkdir(parents=True, exist_ok=True)
-
-            results = {"fold": fold}
-            LOGGER.info("Calculating on folds...")
-
-            eer, thresh, fpr, tpr = calculate_eer_for_models(
-                real_model, fake_model,
-                real_dataset_test, fake_dataset_test,
-                f"train_fold_{fold}", "all",
-                plot_dir_path=str(plot_path), device=device,
-            )
-            results.update({
-                "eer": str(eer), "thresh": str(thresh),
-                "fpr": str(list(fpr)), "tpr": str(list(tpr))
-            })
-            LOGGER.info(f"{subtype} | Fold {fold}:\n\tEER: {eer} Thresh: {thresh}")
-            complete_results.setdefault(subtype, {})[fold] = results
-
-    with open(f"{output_file_name}.json", "w+") as f:
-        json.dump(complete_results, f, indent=4)
-
-
 def main(args):
     device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
 
@@ -346,7 +271,6 @@ def main(args):
             output_file_name="gmm_evaluation",
             use_double_delta=True
         )
-
 
 def parse_args():
     parser = argparse.ArgumentParser()

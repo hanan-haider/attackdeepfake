@@ -42,6 +42,14 @@ DIAGNOSED ROOT CAUSES OF RESULT INSTABILITY
    ✅ Kept the torch.amax() fix from previous iteration.
    ✅ Gradient checkpointing on all CNN stages retained.
 
+5. BUG FIX (this version): MultiScaleTemporalConv groups error
+   ✅ Root cause: groups=min(branch_dim, dim) is invalid when dim is not
+      divisible by that value (e.g. lstm_dim=160, branch_dim=53, gcd=1).
+   ✅ Fix: groups computed as math.gcd(dim, branch_dim), which always
+      yields a valid divisor for both in_channels and out_channels.
+      Falls back to groups=1 when no common factor exists — correct and
+      equivalent in expressiveness for this use case.
+
 ARCHITECTURE OVERVIEW
 ─────────────────────
 Input: [B, C, F, T]  (C channels, F freq bins, T time frames)
@@ -220,7 +228,7 @@ class FrequencyAttention(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW: MultiScaleTemporalConv — captures artefacts at multiple time-scales
+# FIXED: MultiScaleTemporalConv — captures artefacts at multiple time-scales
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MultiScaleTemporalConv(nn.Module):
@@ -234,27 +242,41 @@ class MultiScaleTemporalConv(nn.Module):
     Using all three then projecting back ensures the model can fire on
     whichever scale is diagnostic — critical for WaveFake fold 1 stability.
 
+    BUG FIX: The original code used groups=min(branch_dim, dim) in Conv1d,
+    which is invalid unless dim is divisible by that value.
+    (e.g. lstm_dim=160, branch_dim=53 → gcd=1, so groups must be 1.)
+    Fix: groups = math.gcd(dim, branch_dim), guaranteed to divide both
+    in_channels (dim) and out_channels (branch_dim).
+
     Input/output: [B, T, D]  (sequence dimension first for temporal conv)
     """
     def __init__(self, dim: int, dropout: float = 0.1):
         super().__init__()
-        assert dim % 3 == 0 or True, "dim need not be divisible by 3"
         branch_dim = max(dim // 3, 1)
 
+        # ── KEY FIX ──────────────────────────────────────────────────────
+        # groups must divide BOTH in_channels=dim AND out_channels=branch_dim.
+        # math.gcd always satisfies this; falls back to 1 when coprime.
+        valid_groups = math.gcd(dim, branch_dim)
+
         def branch(dilation):
-            pad = dilation  # causal-style: kernel=3, pad=dilation keeps T
+            pad = dilation  # kernel=3, pad=dilation keeps T length
             return nn.Sequential(
-                # Conv1d operates on [B, D, T], so we transpose in forward
-                nn.Conv1d(dim, branch_dim, kernel_size=3,
-                          padding=pad, dilation=dilation,
-                          groups=min(branch_dim, dim), bias=False),
+                nn.Conv1d(
+                    dim, branch_dim,
+                    kernel_size=3,
+                    padding=pad,
+                    dilation=dilation,
+                    groups=valid_groups,   # ← FIXED (was min(branch_dim, dim))
+                    bias=False,
+                ),
                 nn.BatchNorm1d(branch_dim),
                 nn.GELU(),
             )
 
-        self.b1 = branch(1)
-        self.b2 = branch(2)
-        self.b4 = branch(4)
+        self.b1   = branch(1)
+        self.b2   = branch(2)
+        self.b4   = branch(4)
         self.proj = nn.Linear(branch_dim * 3, dim)
         self.ln   = nn.LayerNorm(dim)
         self.drop = nn.Dropout(dropout)
@@ -262,15 +284,15 @@ class MultiScaleTemporalConv(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, D]
         xt = x.transpose(1, 2)         # [B, D, T]
-        o1 = self.b1(xt)               # [B, branch_dim, T]
+        o1 = self.b1(xt)               # [B, branch_dim, T']
         o2 = self.b2(xt)
         o4 = self.b4(xt)
-        # align T (dilation padding may add 1 frame)
+        # Trim to original T (dilation padding may add 1 frame)
         T  = x.size(1)
         o1 = o1[..., :T]
         o2 = o2[..., :T]
         o4 = o4[..., :T]
-        out = torch.cat([o1, o2, o4], dim=1).transpose(1, 2)  # [B, T, 3*branch]
+        out = torch.cat([o1, o2, o4], dim=1).transpose(1, 2)  # [B, T, 3*branch_dim]
         return self.ln(x + self.drop(self.proj(out)))
 
 
@@ -411,6 +433,7 @@ class LCNN(nn.Module):
       ✅ MixupBatch (α=0.2) in forward for cross-generator generalisation
       ✅ Wider SpecAugment masks (12 freq / 25 time) — in-place, no clone
       ✅ MultiScaleTemporalConv (dilations 1,2,4) before BLSTM
+         [FIXED: groups=math.gcd(dim, branch_dim) — was ValueError]
       ✅ LayerNorm on BLSTM output — stable hidden states across fold lengths
       ✅ StochasticDepth on residual connections — fold-level regularisation
       ✅ Label smoothing ε=0.05 via smoothed_bce_loss() helper
@@ -434,14 +457,14 @@ class LCNN(nn.Module):
 
     def __init__(self, **kwargs):
         super().__init__()
-        in_ch          = kwargs.get("input_channels",   3)
-        num_coeff      = kwargs.get("num_coefficients", 80)
-        dropout        = kwargs.get("dropout",          0.4)
-        self.use_aug   = kwargs.get("use_spec_augment", True)
-        self.use_mixup = kwargs.get("use_mixup",        True)
-        self.mixup_alpha = kwargs.get("mixup_alpha",    0.2)
-        drop_path      = kwargs.get("drop_path_rate",   0.1)
-        self.use_ckpt  = kwargs.get("use_checkpoint",   True)
+        in_ch            = kwargs.get("input_channels",   3)
+        num_coeff        = kwargs.get("num_coefficients", 80)
+        dropout          = kwargs.get("dropout",          0.4)
+        self.use_aug     = kwargs.get("use_spec_augment", True)
+        self.use_mixup   = kwargs.get("use_mixup",        True)
+        self.mixup_alpha = kwargs.get("mixup_alpha",      0.2)
+        drop_path        = kwargs.get("drop_path_rate",   0.1)
+        self.use_ckpt    = kwargs.get("use_checkpoint",   True)
         self.num_coefficients = num_coeff
         self.v_emd_dim = 1
 
@@ -489,17 +512,18 @@ class LCNN(nn.Module):
         self.freq_attn = FrequencyAttention(channels=32)
 
         # ── Temporal dimensions ───────────────────────────────────────────
+        # After 4× MaxPool2d(2,2): F → F/16, channel=32
         lstm_dim = (num_coeff // 16) * 32
 
-        # ── Multi-scale temporal conv (NEW) ───────────────────────────────
+        # ── Multi-scale temporal conv (groups bug fixed) ──────────────────
         self.ms_conv = MultiScaleTemporalConv(lstm_dim, dropout=dropout * 0.25)
 
         # ── Temporal pipeline ─────────────────────────────────────────────
-        self.blstm1   = BLSTMLayer(lstm_dim, lstm_dim)
-        self.trans    = PreNormTransformerLayer(
+        self.blstm1 = BLSTMLayer(lstm_dim, lstm_dim)
+        self.trans  = PreNormTransformerLayer(
             lstm_dim, nhead=4, dropout=dropout * 0.25
         )
-        self.blstm2   = BLSTMLayer(lstm_dim, lstm_dim)
+        self.blstm2 = BLSTMLayer(lstm_dim, lstm_dim)
 
         # StochasticDepth on the second BLSTM residual
         self.sd       = StochasticDepth(drop_prob=drop_path)
@@ -592,13 +616,13 @@ class LCNN(nn.Module):
         h = self.seq_drop(h)
 
         # Attentive statistics pooling: concat(attended_mean, attended_std)
-        w      = torch.softmax(self.attn_pool(h), dim=1)   # [B, T', 1]
-        mean   = (h * w).sum(dim=1)                         # [B, lstm_dim]
-        sq_mean= (h ** 2 * w).sum(dim=1)
-        std    = (sq_mean - mean ** 2).clamp(min=1e-9).sqrt()
-        pooled = torch.cat([mean, std], dim=1)              # [B, lstm_dim*2]
+        w       = torch.softmax(self.attn_pool(h), dim=1)  # [B, T', 1]
+        mean    = (h * w).sum(dim=1)                        # [B, lstm_dim]
+        sq_mean = (h ** 2 * w).sum(dim=1)
+        std     = (sq_mean - mean ** 2).clamp(min=1e-9).sqrt()
+        pooled  = torch.cat([mean, std], dim=1)             # [B, lstm_dim*2]
 
-        logit  = self.head(pooled)                          # [B, 1]
+        logit = self.head(pooled)                           # [B, 1]
         return logit, mixed_y
 
     def forward(
@@ -692,6 +716,7 @@ Stability fixes applied (vs previous version):
   1. Mixup (α=0.2)          — cross-generator boundary smoothing
   2. Wider SpecAugment      — ignore narrow vocoder fingerprints
   3. MultiScaleTemporalConv — dilations 1,2,4 for multi-scale artefacts
+     [FIXED: groups=math.gcd(dim, branch_dim) instead of min(...)]
   4. LayerNorm on BLSTM out — stable hidden states across fold lengths
   5. StochasticDepth (0.1)  — fold-level regularisation on residuals
   6. Attentive stats pool   — mean+std concatenation for richer embedding

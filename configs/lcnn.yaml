@@ -4,6 +4,10 @@ data:
     frontend_algorithm: ["lfcc"]   # ["mfcc"] or ["lfcc"] or ["mfcc", "lfcc"]
     use_spectrogram: False
 
+
+checkpoint:
+  paths: [ ]
+
 model:
   name: "lcnn"
   parameters:

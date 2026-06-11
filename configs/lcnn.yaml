@@ -1,16 +1,19 @@
 data:
   seed: 42
   cnn_features_setting:
-    frontend_algorithm: ["lfcc"]  # ["mfcc"] or ["lfcc"] or ["mfcc", "lfcc"]
+    frontend_algorithm: ["lfcc"]   # ["mfcc"] or ["lfcc"] or ["mfcc", "lfcc"]
     use_spectrogram: False
-
-checkpoint:
-  paths: []
 
 model:
   name: "lcnn"
   parameters:
     input_channels: 1
+    num_coefficients: 80
+    dropout: 0.15
+    use_spec_augment: False
+    use_checkpoint: False
   optimizer:
     lr: 0.0001
+
+
  

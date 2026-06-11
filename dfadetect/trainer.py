@@ -97,8 +97,11 @@ class GDTrainer(Trainer):
         optim = self.optimizer_fn(model.parameters(), **self.optimizer_kwargs)
 
 
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optim, max_lr=3e-4, self.epochs, steps_per_epoch=len(train_loader)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(        
+            optim, 
+            max_lr=3e-4, 
+            epochs=self.epochs, 
+            steps_per_epoch=len(train_loader)
         )
         best_model = None
         best_acc = 0

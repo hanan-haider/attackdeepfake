@@ -98,7 +98,7 @@ class GDTrainer(Trainer):
 
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=3e-4, epochs=30, steps_per_epoch=len(train_loader)
+        optim, max_lr=3e-4, self.epochs, steps_per_epoch=len(train_loader)
         )
         best_model = None
         best_acc = 0
@@ -141,6 +141,7 @@ class GDTrainer(Trainer):
                 optim.zero_grad()
                 batch_loss.backward()
                 optim.step()
+                scheduler.step() 
 
             running_loss /= num_total
             train_accuracy = (num_correct/num_total)*100

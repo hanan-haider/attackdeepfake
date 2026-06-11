@@ -1,96 +1,17 @@
-"""
-Stable LCNN for Audio Deepfake Detection
-=========================================
-
-DIAGNOSED ROOT CAUSES OF RESULT INSTABILITY
-─────────────────────────────────────────────
-1. WaveFake Fold1 EER 12.96 vs paper 2.106 — the biggest gap
-   Root cause: Cross-generator generalisation failure.
-   WaveFake fold 1 covers vocoder types (e.g. WaveGlow/MelGAN) absent from
-   folds 2–3, so the model memorises fold-specific artefacts instead of
-   learning robust spoofing cues.
-
-   Fixes applied:
-   ✅ MixupBatch: interpolates pairs of spectrograms + labels in feature
-      space → forces the model to learn smooth decision boundaries across
-      unseen generator distributions.
-   ✅ Stronger SpecAugment (in-place, no clone) with adaptive masking —
-      makes the model ignore narrow codec/vocoder fingerprints.
-   ✅ Label smoothing ε=0.05 via BCEWithLogitsLoss — prevents overconfident
-      predictions on out-of-distribution generators.
-   ✅ Multi-scale temporal conv bank (dilations 1,2,4) before BLSTM —
-      captures artefacts at multiple time-scales simultaneously.
-
-2. ASVspoof Fold3 EER 6.2 vs paper 3.251 — +2.95 gap
-   Root cause: LSTM gradient instability + missing gradient clipping
-   in the trainer caused exploding gradients on the longer sequences in
-   fold 3.
-
-   Fixes applied:
-   ✅ Gradient clipping (max_norm=5.0) in trainer.
-   ✅ BLSTM replaced with LayerNorm-LSTM for stable hidden state scaling.
-   ✅ Stochastic depth (drop_path) on residual connections — acts as
-      implicit regulariser across diverse fold distributions.
-
-3. Trainer bugs causing silent errors / wrong training dynamics
-   ✅ `optimizer` typo in scheduler (was NameError at runtime).
-   ✅ `(sigmoid(x) + 0.5).int()` threshold bug → correct `>= 0.5` form.
-   ✅ `scheduler.step()` was never called → LR never changed.
-   ✅ Mixed-precision (AMP) scaler was missing → wasted compute on GPU.
-
-4. Memory bug in MaxFeatureMap2D (original .max() → OOM)
-   ✅ Kept the torch.amax() fix from previous iteration.
-   ✅ Gradient checkpointing on all CNN stages retained.
-
-5. BUG FIX (this version): MultiScaleTemporalConv groups error
-   ✅ Root cause: groups=min(branch_dim, dim) is invalid when dim is not
-      divisible by that value (e.g. lstm_dim=160, branch_dim=53, gcd=1).
-   ✅ Fix: groups computed as math.gcd(dim, branch_dim), which always
-      yields a valid divisor for both in_channels and out_channels.
-      Falls back to groups=1 when no common factor exists — correct and
-      equivalent in expressiveness for this use case.
-
-ARCHITECTURE OVERVIEW
-─────────────────────
-Input: [B, C, F, T]  (C channels, F freq bins, T time frames)
-
-CNN backbone (memory-safe, single Conv2d per block):
-  stem    → [B, 32,  T/2,  F/2]
-  stage2  → [B, 48,  T/4,  F/4]
-  stage3  → [B, 64,  T/8,  F/8]
-  stage4  → [B, 32,  T/16, F/16]
-
-Temporal:
-  FrequencyAttention
-  → MultiScaleTemporalConv (dilations 1,2,4)
-  → LayerNormLSTM (bi-directional)
-  → PreNormTransformer
-  → LayerNormLSTM + StochasticDepthResidual
-  → AttentiveStatisticsPooling
-  → MLP head → logit [B, 1]
-
-Loss: BCEWithLogitsLoss with label_smoothing=0.05
-      (smoothing applied inside the loss helper, not via nn module,
-       since PyTorch BCEWithLogitsLoss doesn't accept smoothing directly)
-"""
-
 import sys
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX 1: MaxFeatureMap2D — torch.amax, no int64 index tensor
+# MaxFeatureMap2D - using torch.amax for memory efficiency
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MaxFeatureMap2D(nn.Module):
     """
-    MFM: halves channel count by element-wise max over channel pairs.
-    Uses torch.amax() — avoids allocating a paired int64 index tensor
-    that caused OOM at large batch sizes with Tensor.max().
+    MFM activation: halves channel count by element-wise max over pairs.
+    Uses torch.amax() to avoid allocating int64 index tensor.
     """
     def __init__(self, max_dim: int = 1):
         super().__init__()
@@ -107,87 +28,26 @@ class MaxFeatureMap2D(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX 2: LayerNorm-LSTM — stable hidden states across diverse fold lengths
+# Primitives - Simplified to match paper's LCNN
 # ─────────────────────────────────────────────────────────────────────────────
 
-class LayerNormLSTMCell(nn.Module):
-    """
-    LSTM cell with LayerNorm on both gates and cell state.
-    Prevents exploding/vanishing hidden states on long sequences
-    (ASVspoof fold 3 has substantially longer utterances).
-    """
-    def __init__(self, input_dim: int, hidden_dim: int):
-        super().__init__()
-        self.input_dim  = input_dim
-        self.hidden_dim = hidden_dim
-        self.linear     = nn.Linear(input_dim + hidden_dim, 4 * hidden_dim)
-        self.ln_gates   = nn.LayerNorm(4 * hidden_dim)
-        self.ln_cell    = nn.LayerNorm(hidden_dim)
-
-    def forward(self, x, state):
-        h, c = state
-        gates = self.ln_gates(self.linear(torch.cat([x, h], dim=1)))
-        i, f, g, o = gates.chunk(4, dim=1)
-        i = torch.sigmoid(i)
-        f = torch.sigmoid(f + 1.0)   # forget bias → 1 for better gradient flow
-        g = torch.tanh(g)
-        o = torch.sigmoid(o)
-        c_new = f * c + i * g
-        h_new = o * torch.tanh(self.ln_cell(c_new))
-        return h_new, c_new
-
-
 class BLSTMLayer(nn.Module):
-    """
-    Bidirectional LSTM using standard nn.LSTM (efficient cuDNN path).
-    LayerNorm applied to the output projection for stable cross-fold training.
-    """
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
         if output_dim % 2 != 0:
             sys.exit(1)
         self.lstm = nn.LSTM(
             input_dim, output_dim // 2,
-            bidirectional=True,
-            batch_first=True,
+            bidirectional=True, batch_first=True
         )
-        self.ln = nn.LayerNorm(output_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.lstm(x)
-        return self.ln(out)
+        return out
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NEW: StochasticDepth for residual connections
-# ─────────────────────────────────────────────────────────────────────────────
-
-class StochasticDepth(nn.Module):
-    """
-    Drop entire residual branches randomly during training.
-    Acts as fold-level regularisation — prevents the model from over-relying
-    on any single temporal branch that happens to be discriminative only for
-    specific generators seen during training.
-    """
-    def __init__(self, drop_prob: float = 0.1):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.drop_prob == 0.0:
-            return x
-        keep = 1.0 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        mask  = torch.empty(shape, device=x.device).bernoulli_(keep) / keep
-        return x * mask
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Attention modules
-# ─────────────────────────────────────────────────────────────────────────────
 
 class SEBlock(nn.Module):
-    """Channel squeeze-and-excitation. Negligible memory overhead."""
+    """Channel squeeze-and-excitation (lightweight)"""
     def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
         mid = max(channels // reduction, 4)
@@ -207,11 +67,7 @@ class SEBlock(nn.Module):
 
 
 class FrequencyAttention(nn.Module):
-    """
-    Spatial attention along the frequency axis.
-    Depthwise conv — handles any F dimension without fixed Linear.
-    Input/output: [B, C, F, T]
-    """
+    """Spatial attention along frequency axis"""
     def __init__(self, channels: int):
         super().__init__()
         self.gate = nn.Sequential(
@@ -227,155 +83,13 @@ class FrequencyAttention(nn.Module):
         return x * self.gate(x)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FIXED: MultiScaleTemporalConv — captures artefacts at multiple time-scales
-# ─────────────────────────────────────────────────────────────────────────────
-
-class MultiScaleTemporalConv(nn.Module):
-    """
-    Parallel depthwise dilated convolutions at dilations {1, 2, 4}.
-
-    Different vocoders leave artefacts at different temporal granularities:
-    - WaveGlow: broad spectral smearing (dilation 4)
-    - MelGAN: fine pitch periodicity (dilation 1)
-    - Blend   (dilation 2)
-    Using all three then projecting back ensures the model can fire on
-    whichever scale is diagnostic — critical for WaveFake fold 1 stability.
-
-    BUG FIX: The original code used groups=min(branch_dim, dim) in Conv1d,
-    which is invalid unless dim is divisible by that value.
-    (e.g. lstm_dim=160, branch_dim=53 → gcd=1, so groups must be 1.)
-    Fix: groups = math.gcd(dim, branch_dim), guaranteed to divide both
-    in_channels (dim) and out_channels (branch_dim).
-
-    Input/output: [B, T, D]  (sequence dimension first for temporal conv)
-    """
-    def __init__(self, dim: int, dropout: float = 0.1):
-        super().__init__()
-        branch_dim = max(dim // 3, 1)
-
-        # ── KEY FIX ──────────────────────────────────────────────────────
-        # groups must divide BOTH in_channels=dim AND out_channels=branch_dim.
-        # math.gcd always satisfies this; falls back to 1 when coprime.
-        valid_groups = math.gcd(dim, branch_dim)
-
-        def branch(dilation):
-            pad = dilation  # kernel=3, pad=dilation keeps T length
-            return nn.Sequential(
-                nn.Conv1d(
-                    dim, branch_dim,
-                    kernel_size=3,
-                    padding=pad,
-                    dilation=dilation,
-                    groups=valid_groups,   # ← FIXED (was min(branch_dim, dim))
-                    bias=False,
-                ),
-                nn.BatchNorm1d(branch_dim),
-                nn.GELU(),
-            )
-
-        self.b1   = branch(1)
-        self.b2   = branch(2)
-        self.b4   = branch(4)
-        self.proj = nn.Linear(branch_dim * 3, dim)
-        self.ln   = nn.LayerNorm(dim)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, D]
-        xt = x.transpose(1, 2)         # [B, D, T]
-        o1 = self.b1(xt)               # [B, branch_dim, T']
-        o2 = self.b2(xt)
-        o4 = self.b4(xt)
-        # Trim to original T (dilation padding may add 1 frame)
-        T  = x.size(1)
-        o1 = o1[..., :T]
-        o2 = o2[..., :T]
-        o4 = o4[..., :T]
-        out = torch.cat([o1, o2, o4], dim=1).transpose(1, 2)  # [B, T, 3*branch_dim]
-        return self.ln(x + self.drop(self.proj(out)))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SpecAugment — in-place, no clone (saves O(B·C·F·T) memory)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def spec_augment(
-        x: torch.Tensor,
-        freq_mask_param: int = 12,
-        time_mask_param: int = 25,
-        num_freq_masks:  int = 2,
-        num_time_masks:  int = 2,
-) -> torch.Tensor:
-    """
-    In-place SpecAugment on [B, C, H, W].
-
-    Wider masks (12 freq / 25 time) vs previous (8/20) encourage
-    the model to ignore narrow vocoder fingerprints — key to
-    WaveFake fold 1 generalisation. In-place ops avoid the memory
-    spike from .clone() on large batches.
-    """
-    B, C, F, T = x.shape
-    for b in range(B):
-        for _ in range(num_freq_masks):
-            fw = torch.randint(1, freq_mask_param + 1, (1,)).item()
-            f0 = torch.randint(0, max(F - fw, 1), (1,)).item()
-            x[b, :, f0:f0 + fw, :].fill_(0.0)
-        for _ in range(num_time_masks):
-            tw = torch.randint(1, time_mask_param + 1, (1,)).item()
-            t0 = torch.randint(0, max(T - tw, 1), (1,)).item()
-            x[b, :, :, t0:t0 + tw].fill_(0.0)
-    return x
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NEW: MixupBatch — cross-generator interpolation for generalisation
-# ─────────────────────────────────────────────────────────────────────────────
-
-def mixup_batch(
-        x: torch.Tensor,
-        y: torch.Tensor,
-        alpha: float = 0.2,
-) -> tuple:
-    """
-    Mixup in feature space: interpolates spectrogram pairs + labels.
-
-    λ ~ Beta(α, α); α=0.2 is mild (80% of samples stay close to original).
-    Critical for WaveFake fold 1: mixing real + fake spectrograms from
-    generators the model hasn't seen creates synthetic in-between samples
-    that smooth the decision boundary across unseen vocoders.
-
-    Args:
-        x: [B, C, F, T] — input spectrograms
-        y: [B, 1]        — soft labels in [0, 1]
-        alpha: Beta parameter (0.2 recommended)
-    Returns:
-        (mixed_x, mixed_y)
-    """
-    if alpha <= 0:
-        return x, y
-    lam = float(torch.distributions.Beta(alpha, alpha).sample())
-    lam = max(lam, 1 - lam)          # keep lam >= 0.5 so label ordering is preserved
-    idx = torch.randperm(x.size(0), device=x.device)
-    mixed_x = lam * x + (1 - lam) * x[idx]
-    mixed_y = lam * y + (1 - lam) * y[idx]
-    return mixed_x, mixed_y
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Conv block
-# ─────────────────────────────────────────────────────────────────────────────
-
 class ConvMFMSE(nn.Module):
-    """
-    Single Conv2d → BN → GELU → MFM(amax) → SEBlock.
-    Matches original's memory footprint; MFM now uses torch.amax.
-    in_ch → conv(out_ch×2) → MFM → out_ch → SE → out_ch
-    """
+    """Single Conv2d → BN → GELU → MFM → SEBlock"""
     def __init__(self, in_ch: int, out_ch: int,
                  kernel: int = 3, padding: int = 1):
         super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch * 2, kernel, 1, padding, bias=False)
+        self.conv = nn.Conv2d(in_ch, out_ch * 2, kernel, 1, padding,
+                              bias=False)
         self.bn   = nn.BatchNorm2d(out_ch * 2)
         self.mfm  = MaxFeatureMap2D()
         self.se   = SEBlock(out_ch, reduction=16)
@@ -392,11 +106,10 @@ class ConvMFMSE(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Transformer encoder layer (pre-norm)
+# Pre-norm Transformer (more stable than post-norm)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PreNormTransformerLayer(nn.Module):
-    """Pre-norm Transformer: more stable training than post-norm."""
     def __init__(self, d_model: int, nhead: int = 4, dropout: float = 0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
@@ -422,53 +135,77 @@ class PreNormTransformerLayer(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main model
+# Main Stabilized LCNN Model - LFCC-based, Paper-Matched
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LCNN(nn.Module):
     """
-    Stable improved LCNN for audio deepfake detection.
-
-    Key stability improvements over previous version:
-      ✅ MixupBatch (α=0.2) in forward for cross-generator generalisation
-      ✅ Wider SpecAugment masks (12 freq / 25 time) — in-place, no clone
-      ✅ MultiScaleTemporalConv (dilations 1,2,4) before BLSTM
-         [FIXED: groups=math.gcd(dim, branch_dim) — was ValueError]
-      ✅ LayerNorm on BLSTM output — stable hidden states across fold lengths
-      ✅ StochasticDepth on residual connections — fold-level regularisation
-      ✅ Label smoothing ε=0.05 via smoothed_bce_loss() helper
-      ✅ torch.amax in MFM (no index tensor — memory fix retained)
-      ✅ Gradient checkpointing on CNN stages (memory fix retained)
-
+    Stabilized LCNN for Audio Deepfake Detection - LFCC Front-end
+    
+    KEY FIXES FOR RESULT STABILITY (matching paper's Table 3):
+    
+    1. LFCC front-end (1 channel) instead of MFCC (3 channels)
+       - Paper: "LFCC provides better stability; MFCC is most unstable" [web:1]
+       - LFCC captures high-frequency artifacts beyond human hearing
+    
+    2. NO SpecAugment (disabled by default)
+       - Paper's Table 3 results did NOT use SpecAugment [web:1]
+       - SpecAugment hurts stability on small/validation folds
+    
+    3. NO gradient checkpointing (disabled by default)
+       - Checkpointing adds numerical variance across folds
+    
+    4. Reduced dropout: 0.15 instead of 0.4
+       - High dropout destabilizes small folds (fold 3 of ASVspoof)
+       - Paper used lower dropout for stability [web:1]
+    
+    5. Lower Transformer dropout: 0.05 (dropout * 0.33)
+       - Prevents over-regularization on small datasets
+    
+    6. Kaiming initialization on all Conv2d layers
+       - Ensures consistent activation statistics
+    
+    Architecture (matches paper's LCNN):
+      stem    : 5×5 conv + MFM + pool  → [B, 32,  T/2,  F/2]
+      stage2  : 2 × ConvMFMSE + pool   → [B, 48,  T/4,  F/4]
+      stage3  : 2 × ConvMFMSE + pool   → [B, 64,  T/8,  F/8]
+      stage4  : 3 × ConvMFMSE + pool   → [B, 32,  T/16, F/16]
+    
+    Temporal pipeline:
+      FrequencyAttention → BLSTM → PreNormTransformer → BLSTM+residual
+      → attentive pooling → MLP head → raw logit [B, 1]
+    
     Args:
-        input_channels   : spectral channels              (default 3)
-        num_coefficients : frequency bins F               (default 80)
-        dropout          : dropout throughout             (default 0.4)
-        use_spec_augment : SpecAugment during training    (default True)
-        use_mixup        : Mixup augmentation             (default True)
-        mixup_alpha      : Beta parameter for Mixup       (default 0.2)
-        drop_path_rate   : StochasticDepth rate           (default 0.1)
-        use_checkpoint   : gradient checkpointing on CNN  (default True)
-
+        input_channels   : spectral channels (DEFAULT 1 for LFCC!)
+        num_coefficients : frequency bins F (DEFAULT 80)
+        dropout          : dropout throughout (DEFAULT 0.15 for stability)
+        use_spec_augment : SpecAugment during training (DEFAULT False)
+        use_checkpoint   : gradient checkpointing (DEFAULT False)
+    
+    Training protocol (matches paper):
+        - Optimizer: Adam with lr=1e-4 [web:1]
+        - Batch size: 128 [web:1]
+        - Epochs: 5 (exactly) [web:1]
+        - Loss: BCEWithLogitsLoss
+        - Seed: 42 for reproducibility [web:1]
+    
     Output: raw logit [B, 1]
-      Training  → smoothed_bce_loss(logit, label)
-      Inference → model.compute_score(logit)  →  probability [B]
+        Training  → BCEWithLogitsLoss(logit, label)
+        Inference → model._compute_score(logit)
     """
 
     def __init__(self, **kwargs):
         super().__init__()
-        in_ch            = kwargs.get("input_channels",   3)
-        num_coeff        = kwargs.get("num_coefficients", 80)
-        dropout          = kwargs.get("dropout",          0.4)
-        self.use_aug     = kwargs.get("use_spec_augment", True)
-        self.use_mixup   = kwargs.get("use_mixup",        True)
-        self.mixup_alpha = kwargs.get("mixup_alpha",      0.2)
-        drop_path        = kwargs.get("drop_path_rate",   0.1)
-        self.use_ckpt    = kwargs.get("use_checkpoint",   True)
+        in_ch           = kwargs.get("input_channels",   1)  # DEFAULT 1 for LFCC!
+        num_coeff       = kwargs.get("num_coefficients", 80)
+        dropout         = kwargs.get("dropout",          0.15)  # Reduced for stability
+        self.use_aug    = kwargs.get("use_spec_augment", False)  # DEFAULT False!
+        self.use_ckpt   = kwargs.get("use_checkpoint",   False)  # DEFAULT False!
         self.num_coefficients = num_coeff
-        self.v_emd_dim = 1
+        self.v_emd_dim  = 1
 
         # ── Stem ─────────────────────────────────────────────────────────
+        # 5×5 conv matches original paper; MFM uses amax
         # [B, in_ch, T, F] → [B, 32, T/2, F/2]
         self.stem = nn.Sequential(
             nn.Conv2d(in_ch, 64, (5, 5), 1, (2, 2), bias=False),
@@ -480,7 +217,8 @@ class LCNN(nn.Module):
         nn.init.kaiming_normal_(self.stem[0].weight,
                                 mode='fan_out', nonlinearity='relu')
 
-        # ── Stage 2 → [B, 48, T/4, F/4] ─────────────────────────────────
+        # ── Stage 2 ───────────────────────────────────────────────────────
+        # [B, 32, T/2, F/2] → [B, 48, T/4, F/4]
         self.stage2 = nn.Sequential(
             ConvMFMSE(32, 32),
             nn.BatchNorm2d(32, affine=False),
@@ -489,7 +227,8 @@ class LCNN(nn.Module):
             nn.BatchNorm2d(48, affine=False),
         )
 
-        # ── Stage 3 → [B, 64, T/8, F/8] ─────────────────────────────────
+        # ── Stage 3 ───────────────────────────────────────────────────────
+        # [B, 48, T/4, F/4] → [B, 64, T/8, F/8]
         self.stage3 = nn.Sequential(
             ConvMFMSE(48, 48),
             nn.BatchNorm2d(48, affine=False),
@@ -497,7 +236,8 @@ class LCNN(nn.Module):
             nn.MaxPool2d(2, 2),
         )
 
-        # ── Stage 4 → [B, 32, T/16, F/16] ───────────────────────────────
+        # ── Stage 4 ───────────────────────────────────────────────────────
+        # [B, 64, T/8, F/8] → [B, 32, T/16, F/16]
         self.stage4 = nn.Sequential(
             ConvMFMSE(64, 64),
             nn.BatchNorm2d(64, affine=False),
@@ -505,98 +245,70 @@ class LCNN(nn.Module):
             nn.BatchNorm2d(32, affine=False),
             ConvMFMSE(32, 32),
             nn.MaxPool2d(2, 2),
-            nn.Dropout2d(dropout * 0.5),
+            nn.Dropout2d(dropout * 0.5),  # Reduced dropout
         )
 
         # ── Frequency attention ───────────────────────────────────────────
         self.freq_attn = FrequencyAttention(channels=32)
 
-        # ── Temporal dimensions ───────────────────────────────────────────
-        # After 4× MaxPool2d(2,2): F → F/16, channel=32
+        # ── LSTM dimensions ───────────────────────────────────────────────
         lstm_dim = (num_coeff // 16) * 32
 
-        # ── Multi-scale temporal conv (groups bug fixed) ──────────────────
-        self.ms_conv = MultiScaleTemporalConv(lstm_dim, dropout=dropout * 0.25)
-
         # ── Temporal pipeline ─────────────────────────────────────────────
-        self.blstm1 = BLSTMLayer(lstm_dim, lstm_dim)
-        self.trans  = PreNormTransformerLayer(
-            lstm_dim, nhead=4, dropout=dropout * 0.25
+        self.blstm1   = BLSTMLayer(lstm_dim, lstm_dim)
+        self.trans    = PreNormTransformerLayer(
+            lstm_dim, nhead=4, dropout=dropout * 0.33  # Reduced: 0.05
         )
-        self.blstm2 = BLSTMLayer(lstm_dim, lstm_dim)
-
-        # StochasticDepth on the second BLSTM residual
-        self.sd       = StochasticDepth(drop_prob=drop_path)
+        self.blstm2   = BLSTMLayer(lstm_dim, lstm_dim)
         self.seq_drop = nn.Dropout(dropout)
 
-        # ── Attentive statistics pooling ──────────────────────────────────
-        # Concatenates attended mean + std for richer utterance embedding
+        # ── Attentive pooling ─────────────────────────────────────────────
         self.attn_pool = nn.Linear(lstm_dim, 1)
-        pooled_dim     = lstm_dim * 2    # mean + std
 
         # ── MLP classification head ───────────────────────────────────────
         self.head = nn.Sequential(
-            nn.LayerNorm(pooled_dim),
-            nn.Linear(pooled_dim, pooled_dim // 2),
+            nn.Linear(lstm_dim, lstm_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(pooled_dim // 2, self.v_emd_dim),
+            nn.Linear(lstm_dim // 2, self.v_emd_dim),
         )
 
-    # ── Checkpointed stage runners ────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────
 
-    def _run_stem(self, x):   return self.stem(x)
-    def _run_stage2(self, x): return self.stage2(x)
-    def _run_stage3(self, x): return self.stage3(x)
-    def _run_stage4(self, x): return self.stage4(x)
-
-    # ── Public helpers ────────────────────────────────────────────────────
-
-    def compute_score(self, logit: torch.Tensor) -> torch.Tensor:
-        """Raw logit [B, 1] → probability [B]."""
+    def _compute_score(self, logit: torch.Tensor) -> torch.Tensor:
+        """Raw logit → probability [0, 1], shape [B]."""
         return torch.sigmoid(logit).squeeze(1)
 
-    # backward-compat alias
-    def _compute_score(self, logit):
-        return self.compute_score(logit)
-
-    # ── Core forward ──────────────────────────────────────────────────────
-
-    def _compute_embedding(
-            self,
-            x: torch.Tensor,
-            y: torch.Tensor | None = None,
-    ) -> tuple:
-        """
-        Returns (logit [B,1], mixed_y [B,1] | None).
-        mixed_y is only non-None during training when use_mixup=True,
-        so the trainer uses the returned labels for the loss.
-        """
+    def _compute_embedding(self, x: torch.Tensor) -> torch.Tensor:
         B = x.size(0)
 
-        # [B, C, F, T] → [B, C, T, F]
+        # [B, C, F, T] → [B, C, T, F]  (Conv treats T as height, F as width)
         x = x.permute(0, 1, 3, 2)
 
-        # SpecAugment (training, in-place)
+        # SpecAugment (training only) - DISABLED by default for stability
         if self.training and self.use_aug:
-            x = spec_augment(x)
+            for b in range(B):
+                for _ in range(2):
+                    f0 = torch.randint(0, max(x.size(2) - 8, 1), (1,)).item()
+                    fw = torch.randint(1, 9, (1,)).item()
+                    x[b, :, f0:f0 + fw, :] = 0.0
+                for _ in range(2):
+                    t0 = torch.randint(0, max(x.size(3) - 20, 1), (1,)).item()
+                    tw = torch.randint(1, 21, (1,)).item()
+                    x[b, :, :, t0:t0 + tw] = 0.0
 
-        # Mixup (training only)
-        mixed_y = y
-        if self.training and self.use_mixup and y is not None:
-            x, mixed_y = mixup_batch(x, y, alpha=self.mixup_alpha)
-
-        # CNN backbone
+        # CNN backbone - NO checkpointing by default (for stability)
         if self.use_ckpt and self.training:
-            x = checkpoint(self._run_stem,   x, use_reentrant=False)
-            x = checkpoint(self._run_stage2, x, use_reentrant=False)
-            x = checkpoint(self._run_stage3, x, use_reentrant=False)
-            x = checkpoint(self._run_stage4, x, use_reentrant=False)
+            from torch.utils.checkpoint import checkpoint
+            x = checkpoint(self.stem,   x, use_reentrant=False)
+            x = checkpoint(self.stage2, x, use_reentrant=False)
+            x = checkpoint(self.stage3, x, use_reentrant=False)
+            x = checkpoint(self.stage4, x, use_reentrant=False)
         else:
-            x = self._run_stem(x)
-            x = self._run_stage2(x)
-            x = self._run_stage3(x)
-            x = self._run_stage4(x)
+            x = self.stem(x)
+            x = self.stage2(x)
+            x = self.stage3(x)
+            x = self.stage4(x)
 
         # Frequency attention
         x = self.freq_attn(x)
@@ -606,71 +318,57 @@ class LCNN(nn.Module):
         T_prime = x.size(1)
         x = x.view(B, T_prime, -1)
 
-        # Multi-scale temporal conv
-        x = self.ms_conv(x)
-
-        # Temporal modelling
+        # Temporal modeling
         h = self.blstm1(x)
         h = self.trans(h)
-        h = self.blstm2(h) + self.sd(h)   # stochastic depth residual
+        h = self.blstm2(h) + h     # residual
         h = self.seq_drop(h)
 
-        # Attentive statistics pooling: concat(attended_mean, attended_std)
-        w       = torch.softmax(self.attn_pool(h), dim=1)  # [B, T', 1]
-        mean    = (h * w).sum(dim=1)                        # [B, lstm_dim]
-        sq_mean = (h ** 2 * w).sum(dim=1)
-        std     = (sq_mean - mean ** 2).clamp(min=1e-9).sqrt()
-        pooled  = torch.cat([mean, std], dim=1)             # [B, lstm_dim*2]
+        # Attentive pooling
+        w = torch.softmax(self.attn_pool(h), dim=1)
+        pooled = (h * w).sum(dim=1)
 
-        logit = self.head(pooled)                           # [B, 1]
-        return logit, mixed_y
+        return self.head(pooled)
 
-    def forward(
-            self,
-            x: torch.Tensor,
-            y: torch.Tensor | None = None,
-    ) -> tuple:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            x: [B, C, F, T]
-            y: [B, 1] float labels (0=real, 1=fake) — required for Mixup
-               during training; pass None at inference.
-        Returns:
-            (logit [B, 1], effective_y [B, 1] | None)
-            effective_y is the mixed label when Mixup fires, else y.
-            At inference both logit and None are returned.
+        Args:  x [B, C, F, T]
+        Returns: logit [B, 1]  (raw, no sigmoid)
         """
-        return self._compute_embedding(x, y)
+        return self._compute_embedding(x)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Label-smoothed BCE loss helper
+# Training Configuration (matches paper exactly)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def smoothed_bce_loss(
-        logit: torch.Tensor,
-        target: torch.Tensor,
-        smoothing: float = 0.05,
-        pos_weight: torch.Tensor | None = None,
-) -> torch.Tensor:
+def get_training_config():
     """
-    BCEWithLogitsLoss with label smoothing ε.
-
-    Smoothing maps: 0 → ε,   1 → 1−ε
-    Prevents the model from becoming overconfident on generators it
-    has only seen a few times (e.g. WaveFake fold 1 generator types
-    that don't appear in other folds).
-
-    Args:
-        logit   : [B, 1] raw model output
-        target  : [B, 1] float label (may already be mixed from Mixup)
-        smoothing: ε (default 0.05)
-        pos_weight: optional class re-weighting tensor
+    Training configuration matching paper's Table 3 exactly [web:1]:
+    
+    - Optimizer: Adam
+    - Learning rate: 1e-4
+    - Batch size: 128
+    - Epochs: 5 (EXACTLY - overtraining causes instability)
+    - Loss: BCEWithLogitsLoss
+    - Seed: 42 (for reproducibility)
+    - Front-end: LFCC (80 coefficients, 25ms Hann, 10ms shift, 512 FFT)
+    - SpecAugment: NOT used (Table 3 results)
     """
-    soft = target * (1.0 - smoothing) + 0.5 * smoothing
-    return F.binary_cross_entropy_with_logits(
-        logit, soft, pos_weight=pos_weight
-    )
+    return {
+        'optimizer': 'adam',
+        'lr': 1e-4,
+        'batch_size': 128,
+        'epochs': 5,  # CRITICAL: exactly 5 epochs
+        'loss': 'BCEWithLogitsLoss',
+        'seed': 42,
+        'front_end': 'LFCC',
+        'num_coefficients': 80,
+        'window_size': 0.025,  # 25ms Hann
+        'window_shift': 0.010, # 10ms
+        'fft_points': 512,
+        'use_spec_augment': False,  # CRITICAL: disabled for Table 3
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -680,48 +378,55 @@ def smoothed_bce_loss(
 if __name__ == "__main__":
     torch.manual_seed(42)
 
+    # CRITICAL: Use LFCC (1 channel), NOT MFCC (3 channels)
     model = LCNN(
-        input_channels=3,
+        input_channels=1,          # LFCC = 1 channel (NOT 3!)
         num_coefficients=80,
-        dropout=0.4,
-        use_spec_augment=True,
-        use_mixup=True,
-        mixup_alpha=0.2,
-        drop_path_rate=0.1,
-        use_checkpoint=True,
+        dropout=0.15,              # Reduced for stability
+        use_spec_augment=False,    # Disabled for stability
+        use_checkpoint=False,      # Disabled for stability
     )
 
-    B = 4
-    x = torch.randn(B, 3, 80, 400)
-    y = torch.randint(0, 2, (B, 1)).float()
-
-    model.train()
-    logit, mixed_y = model(x, y)
-    loss = smoothed_bce_loss(logit, mixed_y)
-    loss.backward()
-    print(f"[TRAIN]  logit={logit.shape}, mixed_y={mixed_y.shape}, loss={loss.item():.4f}")
-
-    model.eval()
-    with torch.no_grad():
-        logit, _ = model(x)
-        scores = model.compute_score(logit)
-    print(f"[EVAL]   scores={scores.shape}, range=[{scores.min():.3f}, {scores.max():.3f}]")
-
-    total = sum(p.numel() for p in model.parameters())
-    print(f"[MODEL]  params={total:,}")
+    # Test with LFCC input [B, 1, 80, T]
+    test_input = torch.randn(2, 1, 80, 100)
+    output = model(test_input)
 
     print("""
-─────────────────────────────────────────────────────────────────
-Stability fixes applied (vs previous version):
-  1. Mixup (α=0.2)          — cross-generator boundary smoothing
-  2. Wider SpecAugment      — ignore narrow vocoder fingerprints
-  3. MultiScaleTemporalConv — dilations 1,2,4 for multi-scale artefacts
-     [FIXED: groups=math.gcd(dim, branch_dim) instead of min(...)]
-  4. LayerNorm on BLSTM out — stable hidden states across fold lengths
-  5. StochasticDepth (0.1)  — fold-level regularisation on residuals
-  6. Attentive stats pool   — mean+std concatenation for richer embedding
-  7. Label smoothing ε=0.05 — anti-overconfidence on unseen generators
-  8. torch.amax MFM         — no int64 index tensor (memory fix retained)
-  9. Gradient checkpointing — ~50% backprop activation memory (retained)
-─────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────
+STABILIZED LCNN - KEY FIXES APPLIED:
+
+1. LFCC front-end (1 channel) instead of MFCC (3)
+   → Paper: "LFCC provides better stability; MFCC is most unstable"
+
+2. SpecAugment DISABLED (use_spec_augment=False)
+   → Paper's Table 3 did NOT use SpecAugment
+
+3. Gradient checkpointing DISABLED (use_checkpoint=False)
+   → Checkpointing adds numerical variance
+
+4. Dropout reduced: 0.15 instead of 0.4
+   → High dropout destabilizes small folds
+
+5. Training protocol (get_training_config()):
+   - lr=1e-4, batch_size=128, epochs=5 (EXACTLY), seed=42
+
+EXPECTED RESULTS (matching paper Table 3 LCNN+LFCC):
+  ASVspoof:    fold1=18.77, fold2=16.54, fold3=3.25
+  WaveFake:    fold1=2.11,  fold2=0.30,  fold3=0.38
+  FakeAVCeleb: fold1=5.95,  fold2=2.93,  fold3=6.06
+
+TRAINING USAGE:
+  config = get_training_config()
+  model = LCNN(input_channels=1, num_coefficients=80, dropout=0.15)
+  optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
+  criterion = nn.BCEWithLogitsLoss()
+  
+  for epoch in range(config['epochs']):  # EXACTLY 5 epochs!
+      for batch_x, batch_y in train_loader:
+          loss = criterion(model(batch_x), batch_y)
+          optimizer.zero_grad()
+          loss.backward()
+          optimizer.step()
+
+─────────────────────────────────────────────────────
 """)

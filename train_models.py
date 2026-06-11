@@ -229,7 +229,10 @@ def parse_args():
     parser.add_argument(
         "--verbose", "-v", help="Display debug information?", action="store_true")
 
- 
+    # GMM arguments
+    parser.add_argument(
+        "--use_gmm", help="[GMM] Use to train GMM, otherwise - NNs", action="store_true"
+    )
 
     default_k = 128
     parser.add_argument(

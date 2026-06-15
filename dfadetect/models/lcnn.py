@@ -8,6 +8,8 @@ import torch.nn.functional as F
 # MaxFeatureMap2D - using torch.amax for memory efficiency
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+
 class MaxFeatureMap2D(nn.Module):
     """
     MFM activation: halves channel count by element-wise max over pairs.

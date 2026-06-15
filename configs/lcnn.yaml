@@ -1,7 +1,7 @@
 data:
   seed: 42
   cnn_features_setting:
-    frontend_algorithm: ["lfcc"]   # ["mfcc"] or ["lfcc"] or ["mfcc", "lfcc"]
+    frontend_algorithm: ["mfcc"]   # ["mfcc"] or ["lfcc"] or ["mfcc", "lfcc"]
     use_spectrogram: False
 
 

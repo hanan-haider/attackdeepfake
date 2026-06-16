@@ -39,6 +39,9 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 LOGGER = logging.getLogger(__name__)
 
 
+# Set the logger to ONLY print the message, dropping the INFO prefix
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+
 # ======================================================================
 #  Data setting dataclass — unchanged from original
 # ======================================================================
@@ -281,7 +284,7 @@ class GDTrainer(Trainer):
             running_loss   /= num_total
             train_accuracy  = (num_correct / num_total) * 100
 
-            print(
+            LOGGER.info(
             f"\nEpoch [{epoch+1}/{self.epochs}]: "
             f"train/{logging_prefix}__loss: {running_loss:.4f}, "
             f"train/{logging_prefix}__accuracy: {train_accuracy:.2f}%"

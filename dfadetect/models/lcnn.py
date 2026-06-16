@@ -30,7 +30,6 @@ from torch.utils.checkpoint import checkpoint
 #  LOSS — FIX 7: Label smoothing + FIX 2: pos_weight support
 # ======================================================================
 
-<<<<<<< HEAD
 class SmoothedBCEWithLogitsLoss(nn.Module):
     """
     BCEWithLogitsLoss with label smoothing and optional pos_weight.
@@ -148,10 +147,6 @@ def build_scheduler(
 #  new .amax(): values(4B) only          ~ 2.6 GB peak
 # ======================================================================
 
-=======
-
-
->>>>>>> 04cfb7ab3d4910b54890842c6263004ca1687f5e
 class MaxFeatureMap2D(nn.Module):
     """
     MFM activation: halves channel count by element-wise max over pairs.

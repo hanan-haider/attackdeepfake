@@ -3,6 +3,7 @@ data:
   cnn_features_setting:
     frontend_algorithm: ["mfcc"]   # ["mfcc"] or ["lfcc"] or ["mfcc", "lfcc"]
     use_spectrogram: False
+    use_deltas: False 
 
 
 checkpoint:

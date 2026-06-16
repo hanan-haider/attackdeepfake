@@ -281,10 +281,10 @@ class GDTrainer(Trainer):
             running_loss   /= num_total
             train_accuracy  = (num_correct / num_total) * 100
 
-            LOGGER.info(
-                f"Epoch [{epoch+1}/{self.epochs}]: "
-                f"train/{logging_prefix}__loss: {running_loss:.4f}, "
-                f"train/{logging_prefix}__accuracy: {train_accuracy:.2f}%"
+            print(
+            f"\nEpoch [{epoch+1}/{self.epochs}]: "
+            f"train/{logging_prefix}__loss: {running_loss:.4f}, "
+            f"train/{logging_prefix}__accuracy: {train_accuracy:.2f}%"
             )
             torch.cuda.empty_cache()
 

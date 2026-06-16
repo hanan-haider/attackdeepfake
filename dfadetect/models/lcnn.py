@@ -98,7 +98,7 @@ def build_scheduler(
         optimizer: torch.optim.Optimizer,
         warmup_epochs: int = 5,
         cosine_T0: int    = 10,
-        cosine_T_mult: int = 2,
+        cosine_T_mult: int = 1,
         eta_min: float    = 1e-6,
 ) -> torch.optim.lr_scheduler.SequentialLR:
     """

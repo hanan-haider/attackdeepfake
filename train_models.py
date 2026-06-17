@@ -16,9 +16,9 @@ from dfadetect.models import models
 from dfadetect.trainer import GDTrainer, NNDataSetting #, GMMTrainer
 from dfadetect.utils import set_seed
 from experiment_config import feature_kwargs
-from dfadetect.cnn_features import CNNFeaturesSetting, count_input_channels
-cfg = CNNFeaturesSetting(frontend_algorithm=["lfcc"], use_spectrogram=False)
-print(count_input_channels(cfg))  # → 1
+#from dfadetect.cnn_features import CNNFeaturesSetting, count_input_channels
+#cfg = CNNFeaturesSetting(frontend_algorithm=["lfcc"], use_spectrogram=False)
+#print(count_input_channels(cfg))  # → 1
 
 LOGGER = logging.getLogger()
 

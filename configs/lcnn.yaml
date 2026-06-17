@@ -14,7 +14,7 @@ model:
   parameters:
     input_channels: 1
     num_coefficients: 80
-    dropout: 0.15
+    dropout: 0
     use_spec_augment: True
     use_checkpoint: True
   optimizer:

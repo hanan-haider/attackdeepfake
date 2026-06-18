@@ -111,7 +111,7 @@ class FakeAVCelebDataset(SimpleAudioFakeDataset):
             We want:
               '/kaggle/input/datasets/mrquadian/fakeavceleb/FakeVideo-FakeAudio/African/men/id00076/...flac'
             """
-            rel = sample["audio_path"]
+            rel = sample["audio_path"].strip()
     
             # If audio_path starts with 'FakeAVCeleb/', drop that part
             parts = rel.split("/")

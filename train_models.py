@@ -82,9 +82,9 @@ def train_nn(
             fakeavceleb_path=datasets_paths[2],
             fold_num=fold,
             fold_subset="train",
+            reduced_number=amount_to_use,
             oversample=args.oversample,
             undersample=args.undersample,
-            reduced_number=args.reduced_number,
         )
 
         data_test = AttackAgnosticDataset(
@@ -167,12 +167,13 @@ def main(args):
         train_nn(
             datasets_paths=[args.asv_path, args.wavefake_path, args.celeb_path],
             device=device,
+            amount_to_use=args.amount,
             batch_size=args.batch_size,
             epochs=args.epochs,
             model_dir=model_dir,
             model_config=config["model"],
             cnn_features_setting=cnn_features_setting,
-            reduced_number=args.reduced_number,
+            
         )
     else:
         feature_fn = lfcc if args.lfcc else mfcc

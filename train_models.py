@@ -83,7 +83,9 @@ def train_nn(
             fold_num=fold,
             fold_subset="train",
             reduced_number=amount_to_use,
-            oversample=True,
+            oversample=args.oversample,
+            undersample=args.undersample,
+            reduced_number=args.reduced_number,
         )
 
         data_test = AttackAgnosticDataset(
@@ -94,7 +96,7 @@ def train_nn(
             fold_num=fold,
             fold_subset="test",
             reduced_number=amount_to_use,
-            oversample=True,
+            
         )
 
         current_model = models.get_model(
@@ -247,6 +249,30 @@ def parse_args():
     )
     return parser.parse_args()
 
+    # Oversample (default: True — matches your current AttackAgnosticDataset default)
+    parser.add_argument(
+        "--oversample",
+        help="Oversample bonafide class to match spoof count? (default: True)",
+        action="store_true",
+        default=True
+    )
+    
+    # Undersample (default: False)
+    parser.add_argument(
+        "--undersample",
+        help="Undersample spoof class to match bonafide count? (default: False)",
+        action="store_true",
+        default=False
+    )
+    
+    # Reduced number
+    default_reduced_number = None
+    parser.add_argument(
+        "--reduced_number", "-r",
+        help=f"Limit total dataset samples per fold — useful for large datasets (default: {default_reduced_number} - use all).",
+        type=int,
+        default=default_reduced_number
+    )
 
 if __name__ == "__main__":
     main(parse_args())

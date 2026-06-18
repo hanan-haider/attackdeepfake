@@ -1,6 +1,4 @@
 """A generic training wrapper."""
-#orginal trainer code of attackdeepfake and its works with improvedlcnnmodel to give the best result 
-#except fold 1 and fold3
 import logging
 from copy import deepcopy
 from dataclasses import dataclass
@@ -12,14 +10,7 @@ from torch.utils.data import DataLoader
 
 from dfadetect import cnn_features
 #from dfadetect.datasets import TransformDataset
-
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 LOGGER = logging.getLogger(__name__)
-LOGGER = logging.getLogger(__name__)
-
-
 # Set the logger to ONLY print the message, dropping the INFO prefix
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
@@ -56,7 +47,6 @@ class Trainer():
         self.optimizer_kwargs = optimizer_kwargs
         self.epoch_test_losses: List[float] = []
 
-
 def forward_and_loss(model, criterion, batch_x, batch_y, **kwargs):
     batch_out = model(batch_x)
     batch_loss = criterion(batch_out, batch_y)
@@ -90,23 +80,18 @@ class GDTrainer(Trainer):
             batch_size=self.batch_size,
             shuffle=True,
             drop_last=True,
-            num_workers=4,
-            pin_memory=True,
+            num_workers=6,
         )
         test_loader = DataLoader(
             test,
             batch_size=self.batch_size,
             drop_last=True,
-            num_workers=4,
+            num_workers=6,
         )
 
         criterion = torch.nn.BCEWithLogitsLoss()
         optim = self.optimizer_fn(model.parameters(), **self.optimizer_kwargs)
 
-
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer=optim, max_lr=3e-4, epochs=self.epochs, steps_per_epoch=len(train_loader)
-        )
         best_model = None
         best_acc = 0
 
@@ -143,7 +128,7 @@ class GDTrainer(Trainer):
 
                 if i % 100 == 0:
                     LOGGER.info(
-                         f"[Epoch {epoch:04d}] [Step {i:05d}] | Loss: {running_loss / num_total:.4f} | Acc: {num_correct / num_total * 100:.2f}%")
+                         f"[{epoch:04d}][{i:05d}]: {running_loss / num_total} {num_correct/num_total*100}")
 
                 optim.zero_grad()
                 batch_loss.backward()
@@ -153,45 +138,43 @@ class GDTrainer(Trainer):
             train_accuracy = (num_correct/num_total)*100
 
             LOGGER.info(f"Epoch [{epoch+1}/{self.epochs}]: train/{logging_prefix}__loss: {running_loss}, train/{logging_prefix}__accuracy: {train_accuracy}")
-            torch.cuda.empty_cache()
 
             test_running_loss = 0.0
             num_correct = 0.0
             num_total = 0.0
             model.eval()
-            with torch.no_grad():
-                for batch_x, _, batch_y in test_loader:
-    
-                    batch_size = batch_x.size(0)
-                    num_total += batch_size
-                    batch_x = batch_x.to(self.device)
-    
-                    if nn_data_setting.use_cnn_features:
-                        batch_x = cnn_features.prepare_feature_vector(batch_x, cnn_features_setting=cnn_features_setting)
-    
-                    batch_y = batch_y.unsqueeze(1).type(torch.float32).to(self.device)
-                    batch_out = model(batch_x)
-                    batch_loss = criterion(batch_out, batch_y)
-    
-                    test_running_loss += (batch_loss.item() * batch_size)
-    
-                    batch_pred = (torch.sigmoid(batch_out) + .5).int()
-                    num_correct += (batch_pred == batch_y.int()).sum(dim=0).item()
-    
-                if num_total == 0:
-                    num_total = 1
-    
-                test_running_loss /= num_total
-                test_acc = 100 * (num_correct / num_total)
-                LOGGER.info(f"Epoch [{epoch+1}/{self.epochs}]: test/{logging_prefix}__loss: {test_running_loss}, test/{logging_prefix}__accuracy: {test_acc}")
+            for batch_x, _, batch_y in test_loader:
+
+                batch_size = batch_x.size(0)
+                num_total += batch_size
+                batch_x = batch_x.to(self.device)
+
+                if nn_data_setting.use_cnn_features:
+                    batch_x = cnn_features.prepare_feature_vector(batch_x, cnn_features_setting=cnn_features_setting)
+
+                batch_y = batch_y.unsqueeze(1).type(torch.float32).to(self.device)
+                batch_out = model(batch_x)
+                batch_loss = criterion(batch_out, batch_y)
+
+                test_running_loss += (batch_loss.item() * batch_size)
+
+                batch_pred = (torch.sigmoid(batch_out) + .5).int()
+                num_correct += (batch_pred == batch_y.int()).sum(dim=0).item()
+
+            if num_total == 0:
+                num_total = 1
+
+            test_running_loss /= num_total
+            test_acc = 100 * (num_correct / num_total)
+            LOGGER.info(f"Epoch [{epoch+1}/{self.epochs}]: test/{logging_prefix}__loss: {test_running_loss}, test/{logging_prefix}__accuracy: {test_acc}")
 
 
-                if best_model is None or test_acc > best_acc:
-                    best_acc = test_acc
-                    best_model = deepcopy(model.state_dict())
-    
-                LOGGER.info(
-                    f"[{epoch:04d}]: {running_loss} -- train acc: {train_accuracy} -- test_acc: {test_acc}")
+            if best_model is None or test_acc > best_acc:
+                best_acc = test_acc
+                best_model = deepcopy(model.state_dict())
+
+            LOGGER.info(
+                f"[{epoch:04d}]: {running_loss} - train acc: {train_accuracy} - test_acc: {test_acc}")
 
         model.load_state_dict(best_model)
         return model

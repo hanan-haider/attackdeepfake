@@ -16,7 +16,7 @@ class AttackAgnosticDataset(SimpleAudioFakeDataset):
         fold_num=0,
         fold_subset="val",
         transform=None,
-        oversample=True,
+        oversample=False,
         undersample=False,
         return_label=True,
         reduced_number=None,

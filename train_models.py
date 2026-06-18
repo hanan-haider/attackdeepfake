@@ -82,7 +82,6 @@ def train_nn(
             fakeavceleb_path=datasets_paths[2],
             fold_num=fold,
             fold_subset="train",
-            reduced_number=amount_to_use,
             oversample=args.oversample,
             undersample=args.undersample,
             reduced_number=args.reduced_number,

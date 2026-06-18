@@ -172,8 +172,6 @@ def main(args):
             model_dir=model_dir,
             model_config=config["model"],
             cnn_features_setting=cnn_features_setting,
-            oversample=args.oversample,        # ✅ pass through
-            undersample=args.undersample,      # ✅ pass through
             reduced_number=args.reduced_number,
         )
     else:

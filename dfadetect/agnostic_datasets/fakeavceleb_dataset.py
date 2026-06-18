@@ -34,7 +34,7 @@ class FakeAVCelebDataset(SimpleAudioFakeDataset):
 
     audio_folder = " "
     audio_extension = ".flac"
-    metadata_file = Path(audio_folder) / "meta_data_selected_methods.csv"
+    metadata_file = "meta_data_selected_methods.csv"
     subsets = ("train", "dev", "eval")
 
     def __init__(self, path, fold_num=0, fold_subset="train", transform=None):

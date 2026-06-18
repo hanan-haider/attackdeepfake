@@ -79,15 +79,15 @@ def train_nn(
 
     for fold in range(folds_number):
         data_train = AttackAgnosticDataset(
-            asvspoof_path=datasets_paths[0],
-            wavefake_path=datasets_paths[1],
+            #asvspoof_path=datasets_paths[0],
+            #wavefake_path=datasets_paths[1],
             fakeavceleb_path=datasets_paths[2],
             fold_num=fold,
             fold_subset="train",
             reduced_number=amount_to_use,
             oversample=oversample ,
             undersample= undersample,
-            
+
         )
 
         data_test = AttackAgnosticDataset(

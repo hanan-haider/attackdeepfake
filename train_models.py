@@ -87,7 +87,7 @@ def train_nn(
             reduced_number=amount_to_use,
             oversample=oversample ,
             undersample= undersample,
-
+            
         )
 
         data_test = AttackAgnosticDataset(

@@ -59,6 +59,8 @@ def train_nn(
     device: str,
     model_config: Dict,
     cnn_features_setting: CNNFeaturesSetting,
+    oversample: bool = False,
+    undersample: bool = False,
     model_dir: Optional[Path] = None,
     amount_to_use: Optional[int] = None,
 ) -> None:
@@ -83,8 +85,9 @@ def train_nn(
             fold_num=fold,
             fold_subset="train",
             reduced_number=amount_to_use,
-            oversample=args.oversample,
-            undersample=args.undersample,
+            oversample=oversample ,
+            undersample= undersample,
+
         )
 
         data_test = AttackAgnosticDataset(
@@ -173,6 +176,8 @@ def main(args):
             model_dir=model_dir,
             model_config=config["model"],
             cnn_features_setting=cnn_features_setting,
+            oversample=args.oversample,
+            undersample=args.undersample,
             
         )
     else:

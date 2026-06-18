@@ -167,12 +167,14 @@ def main(args):
         train_nn(
             datasets_paths=[args.asv_path, args.wavefake_path, args.celeb_path],
             device=device,
-            amount_to_use=args.amount,
             batch_size=args.batch_size,
             epochs=args.epochs,
             model_dir=model_dir,
             model_config=config["model"],
             cnn_features_setting=cnn_features_setting,
+            oversample=args.oversample,        # ✅ pass through
+            undersample=args.undersample,      # ✅ pass through
+            reduced_number=args.reduced_number,
         )
     else:
         feature_fn = lfcc if args.lfcc else mfcc
@@ -233,7 +235,7 @@ def parse_args():
 
     parser.add_argument(
         "--verbose", "-v", help="Display debug information?", action="store_true")
-        
+
     parser.add_argument(
         "--oversample",
         help="Oversample bonafide class to match spoof count?",

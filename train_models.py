@@ -234,6 +234,30 @@ def parse_args():
 
     parser.add_argument(
         "--verbose", "-v", help="Display debug information?", action="store_true")
+    # Oversample (default: True — matches your current AttackAgnosticDataset default)
+    parser.add_argument(
+        "--oversample",
+        help="Oversample bonafide class to match spoof count? (default: True)",
+        action="store_true",
+        default=True
+    )
+    
+    # Undersample (default: False)
+    parser.add_argument(
+        "--undersample",
+        help="Undersample spoof class to match bonafide count? (default: False)",
+        action="store_true",
+        default=False
+    )
+    
+    # Reduced number
+    default_reduced_number = None
+    parser.add_argument(
+        "--reduced_number", "-r",
+        help=f"Limit total dataset samples per fold — useful for large datasets (default: {default_reduced_number} - use all).",
+        type=int,
+        default=default_reduced_number
+    )
 
     # GMM arguments
     parser.add_argument(

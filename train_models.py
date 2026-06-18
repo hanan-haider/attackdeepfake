@@ -249,14 +249,6 @@ def parse_args():
         default=False
     )
     
-    # Reduced number
-    default_reduced_number = None
-    parser.add_argument(
-        "--reduced_number", "-r",
-        help=f"Limit total dataset samples per fold — useful for large datasets (default: {default_reduced_number} - use all).",
-        type=int,
-        default=default_reduced_number
-    )
 
     # GMM arguments
     parser.add_argument(

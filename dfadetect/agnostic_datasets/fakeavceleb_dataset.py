@@ -1,7 +1,8 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="numpy")
+
 from pathlib import Path
-
 import pandas as pd
-
 from dfadetect.agnostic_datasets.base_dataset import SimpleAudioFakeDataset
 
 
@@ -32,7 +33,10 @@ FAKEAVCELEB_KFOLD_SPLIT = {
 
 class FakeAVCelebDataset(SimpleAudioFakeDataset):
 
-    audio_folder = " "
+    # FIX 1: Removed the leading space from audio_folder.
+    # Was: audio_folder = " "   ← space caused " /FakeVideo-FakeAudio/..." (invalid path)
+    # Now: audio_folder = ""    ← empty; real path comes from self.path passed at init
+    audio_folder = ""
     audio_extension = ".flac"
     metadata_file = "meta_data_selected_methods.csv"
     subsets = ("train", "dev", "eval")
@@ -41,20 +45,24 @@ class FakeAVCelebDataset(SimpleAudioFakeDataset):
         super().__init__(fold_num, fold_subset, transform)
         self.path = path
 
+        # Set audio_folder to the actual dataset root path
+        self.audio_folder = str(path)
+
         self.fold_num, self.fold_subset = fold_num, fold_subset
         self.allowed_attacks = FAKEAVCELEB_KFOLD_SPLIT[fold_num][fold_subset]
         self.bona_partition = FAKEAVCELEB_KFOLD_SPLIT[fold_num]["bonafide_partition"]
         self.seed = FAKEAVCELEB_KFOLD_SPLIT[fold_num]["seed"]
 
         self.metadata = self.get_metadata()
-
-        self.samples = pd.concat([self.get_fake_samples(), self.get_real_samples()], ignore_index=True)
+        self.samples = pd.concat(
+            [self.get_fake_samples(), self.get_real_samples()],
+            ignore_index=True
+        )
 
     def get_metadata(self):
         md = pd.read_csv(Path(self.path) / self.metadata_file)
         md["audio_type"] = md["type"].apply(lambda x: x.split("-")[-1])
         return md
-
 
     def get_fake_samples(self):
         samples = {
@@ -67,7 +75,8 @@ class FakeAVCelebDataset(SimpleAudioFakeDataset):
 
         for attack_name in self.allowed_attacks:
             fake_samples = self.metadata[
-                (self.metadata["method"] == attack_name) & (self.metadata["audio_type"] == "FakeAudio")
+                (self.metadata["method"] == attack_name) &
+                (self.metadata["audio_type"] == "FakeAudio")
             ]
 
             for index, sample in fake_samples.iterrows():
@@ -89,7 +98,8 @@ class FakeAVCelebDataset(SimpleAudioFakeDataset):
         }
 
         samples_list = self.metadata[
-            (self.metadata["method"] == "real") & (self.metadata["audio_type"] == "RealAudio")
+            (self.metadata["method"] == "real") &
+            (self.metadata["audio_type"] == "RealAudio")
         ]
 
         samples_list = self.split_real_samples(samples_list)
@@ -103,27 +113,30 @@ class FakeAVCelebDataset(SimpleAudioFakeDataset):
 
         return pd.DataFrame(samples)
 
-
     def get_file_path(self, sample):
-            """
-            sample['audio_path'] example:
-              'FakeAVCeleb/FakeVideo-FakeAudio/African/men/id00076/00109_10_id00476_wavtolip.flac'
-            We want:
-              '/kaggle/input/datasets/mrquadian/fakeavceleb/FakeVideo-FakeAudio/African/men/id00076/...flac'
-            """
-            rel = sample["audio_path"].strip()
-    
-            # If audio_path starts with 'FakeAVCeleb/', drop that part
-            parts = rel.split("/")
-            if parts[0] == "FakeAVCeleb":
-                rel = "/".join(parts[1:])
-    
-            # Join with base folder
-            return Path(self.audio_folder) / rel
+        """
+        Builds the absolute path to the audio file.
+
+        sample['audio_path'] example:
+          'FakeAVCeleb/FakeVideo-FakeAudio/African/men/id00076/00109_...wavtolip.flac'
+        Result:
+          '/kaggle/input/datasets/.../FakeVideo-FakeAudio/African/men/id00076/...flac'
+
+        FIX: self.audio_folder is now set to self.path in __init__,
+             so Path(self.audio_folder) / rel gives a valid absolute path.
+        """
+        rel = sample["audio_path"].strip()
+
+        # Drop the 'FakeAVCeleb/' prefix if present
+        parts = rel.split("/")
+        if parts[0] == "FakeAVCeleb":
+            rel = "/".join(parts[1:])
+
+        return Path(self.audio_folder) / rel
 
 
 if __name__ == "__main__":
-    FAKEAVCELEB_DATASET_PATH = ""
+    FAKEAVCELEB_DATASET_PATH = "/kaggle/input/datasets/mrquadian/fakeavceleb"
 
     real = 0
     fake = 0
@@ -131,13 +144,11 @@ if __name__ == "__main__":
         dataset = FakeAVCelebDataset(FAKEAVCELEB_DATASET_PATH, fold_num=2, fold_subset=subset)
         dataset.get_real_samples()
         real += len(dataset)
-
         print('real', len(dataset))
 
         dataset = FakeAVCelebDataset(FAKEAVCELEB_DATASET_PATH, fold_num=2, fold_subset=subset)
         dataset.get_fake_samples()
         fake += len(dataset)
-
         print('fake', len(dataset))
 
     print(real, fake)

@@ -233,19 +233,18 @@ def parse_args():
 
     parser.add_argument(
         "--verbose", "-v", help="Display debug information?", action="store_true")
-    # Oversample (default: True — matches your current AttackAgnosticDataset default)
+        
     parser.add_argument(
         "--oversample",
-        help="Oversample bonafide class to match spoof count? (default: True)",
-        action="store_true",
+        help="Oversample bonafide class to match spoof count?",
+        action=argparse.BooleanOptionalAction,
         default=True
     )
     
-    # Undersample (default: False)
     parser.add_argument(
         "--undersample",
-        help="Undersample spoof class to match bonafide count? (default: False)",
-        action="store_true",
+        help="Undersample spoof class to match bonafide count?",
+        action=argparse.BooleanOptionalAction,
         default=False
     )
     

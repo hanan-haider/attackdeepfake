@@ -116,12 +116,12 @@ def train_nn(
             f"\n{'='*60}\n"
             f"  Fold {fold} — Dataset Statistics\n"
             f"{'='*60}\n"
-            f"  TRAIN        → total: {train_bonafide + train_spoof:>7,}  "
+            f"  TRAIN              → total: {train_bonafide + train_spoof:>7,}  "
             f"| bonafide: {train_bonafide:>6,}  | spoof: {train_spoof:>7,}\n"
-            f"  Validation   → total: {test_bonafide  + test_spoof:>7,}  "
+            f"  Validation(TEST)   → total: {test_bonafide  + test_spoof:>7,}  "
             f"| bonafide: {test_bonafide:>6,}  | spoof: {test_spoof:>7,}\n"
-            f"  Spoof ratio train: {train_spoof / max(train_bonafide, 1):.2f}:1  "
-            f"| Spoof ratio test: {test_spoof / max(test_bonafide, 1):.2f}:1\n"
+            f"  Spoof ratio train:   {train_spoof / max(train_bonafide, 1):.2f}:1  "
+            f"|   Spoof ratio test: {test_spoof / max(test_bonafide, 1):.2f}:1\n"
             f"{'='*60}"
         )
 
@@ -129,9 +129,7 @@ def train_nn(
             model_name=model_name, config=model_parameters, device=device,
         ).to(device)
 
-        #LOGGER.info(f"Training '{model_name}' model on {len(data_train)} audio files.")
-        #LOGGER.info(f"Validation '{model_name}' model on {len(data_test)} audio files.")
-
+ 
         current_model = GDTrainer(
             device=device,
             batch_size=batch_size,

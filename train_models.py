@@ -116,7 +116,7 @@ def train_nn(
             f"\n{'='*60}\n"
             f"  Fold {fold} — Dataset Statistics\n"
             f"{'='*60}\n"
-            f"  TRAIN  → total: {train_bonafide + train_spoof:>7,}  "
+            f"  TRAIN        → total: {train_bonafide + train_spoof:>7,}  "
             f"| bonafide: {train_bonafide:>6,}  | spoof: {train_spoof:>7,}\n"
             f"  Validation   → total: {test_bonafide  + test_spoof:>7,}  "
             f"| bonafide: {test_bonafide:>6,}  | spoof: {test_spoof:>7,}\n"

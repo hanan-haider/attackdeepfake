@@ -149,14 +149,14 @@ def evaluate_nn(
                 y_pred_label = torch.concat([y_pred_label, batch_pred_label], dim=0)
                 y            = torch.concat([y, batch_y], dim=0)
 
-        # ── Convert to numpy ──────────────────────────────────────────────────
+        #   Convert to numpy 
         y_np       = y.cpu().numpy()               # float, 0=fake / 1=bonafide
         y_score_np = y_pred.cpu().numpy()          # sigmoid probs
         y_label_np = y_pred_label.cpu().numpy()    # hard 0/1 predictions
         y_int_np   = y_np.astype(int)
         y_label_int_np = y_label_np.astype(int)
 
-        # ── Core metrics (all using probabilities, consistent convention) ─────
+        #   Core metrics (all using probabilities, consistent convention)   ─
         eval_accuracy = (num_correct / num_total) * 100
 
         precision, recall, f1_score, _ = precision_recall_fscore_support(
@@ -183,7 +183,7 @@ def evaluate_nn(
             f"AUC: {auc_score:.4f}"
         )
 
-        # ── CONFUSION MATRIX ──────────────────────────────────────────────────
+        #   CONFUSION MATRIX 
         cm = confusion_matrix(y_int_np, y_label_int_np)
 
         fig_cm, ax_cm = plt.subplots(figsize=(5, 4))
@@ -215,7 +215,7 @@ def evaluate_nn(
         plt.show()
         print(f"  📊 Confusion matrix saved → confusion_matrix_fold_{fold}.png")
 
-        # ── ROC CURVE ─────────────────────────────────────────────────────────
+        #   ROC CURVE 
         # ✅ FIX 3: Reuse the same fpr/tpr from calculate_eer (no 2nd roc_curve call)
         roc_auc = auc(fpr, tpr)
 

@@ -101,12 +101,36 @@ def train_nn(
             
         )
 
+        # Print dataset statistics right after loading
+        # AttackAgnosticDataset stores samples in a .samples DataFrame
+        # with a 'label' column containing "bonafide" or "spoof" strings.
+        train_label_counts = data_train.samples["label"].value_counts()
+        test_label_counts  = data_test.samples["label"].value_counts()
+    
+        train_bonafide = train_label_counts.get("bonafide", 0)
+        train_spoof    = train_label_counts.get("spoof",    0)
+        test_bonafide  = test_label_counts.get("bonafide",  0)
+        test_spoof     = test_label_counts.get("spoof",     0)
+    
+        LOGGER.info(
+            f"\n{'='*60}\n"
+            f"  Fold {fold} — Dataset Statistics\n"
+            f"{'='*60}\n"
+            f"  TRAIN  → total: {train_bonafide + train_spoof:>7,}  "
+            f"| bonafide: {train_bonafide:>6,}  | spoof: {train_spoof:>7,}\n"
+            f"  Validation   → total: {test_bonafide  + test_spoof:>7,}  "
+            f"| bonafide: {test_bonafide:>6,}  | spoof: {test_spoof:>7,}\n"
+            f"  Spoof ratio train: {train_spoof / max(train_bonafide, 1):.2f}:1  "
+            f"| Spoof ratio test: {test_spoof / max(test_bonafide, 1):.2f}:1\n"
+            f"{'='*60}"
+        )
+
         current_model = models.get_model(
             model_name=model_name, config=model_parameters, device=device,
         ).to(device)
 
-        LOGGER.info(f"Training '{model_name}' model on {len(data_train)} audio files.")
-        LOGGER.info(f"Validation '{model_name}' model on {len(data_test)} audio files.")
+        #LOGGER.info(f"Training '{model_name}' model on {len(data_train)} audio files.")
+        #LOGGER.info(f"Validation '{model_name}' model on {len(data_test)} audio files.")
 
         current_model = GDTrainer(
             device=device,

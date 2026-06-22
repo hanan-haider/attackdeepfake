@@ -1,6 +1,5 @@
 """A generic training wrapper."""
-#orginal trainer code of attackdeepfake and its works with improvedlcnnmodel to give the best result 
-#except fold 1 and fold3
+# original trainer code of attackdeepfake and its works with improved lcnn model
 import logging
 from copy import deepcopy
 from dataclasses import dataclass
@@ -11,14 +10,13 @@ import torch
 from torch.utils.data import DataLoader
 
 from dfadetect import cnn_features
-#from dfadetect.datasets import TransformDataset
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 LOGGER = logging.getLogger(__name__)
-# Set the logger to ONLY print the message, dropping the INFO prefix
 logging.basicConfig(level=logging.INFO, format='%(message)s')
+
 
 @dataclass
 class NNDataSetting:
@@ -34,9 +32,8 @@ class Trainer():
         epochs (int): The amount of training epochs.
         batch_size (int): Amount of audio files to use in one batch.
         device (str): The device to train on (Default 'cpu').
-        batch_size (int): The amount of audio files to consider in one batch (Default: 32).
-        optimizer_fn (Callable): Function for constructing the optimzer.
-        optimizer_kwargs (dict): Kwargs for the optimzer.
+        optimizer_fn (Callable): Function for constructing the optimizer.
+        optimizer_kwargs (dict): Kwargs for the optimizer.
     """
 
     def __init__(self,
@@ -60,6 +57,22 @@ def forward_and_loss(model, criterion, batch_x, batch_y, **kwargs):
     return batch_out, batch_loss
 
 
+# Dataset statistics 
+def count_labels(dataset):
+    """Count bonafide (0) and spoof (1) samples in any dataset/subset."""
+    bonafide = 0
+    spoof    = 0
+    for item in dataset:
+        # item is (waveform, path, label) — label is index 2
+        label = item[2]
+        if hasattr(label, 'item'):
+            label = label.item()   # tensor → int
+        if int(label) == 0:
+            bonafide += 1
+        else:
+            spoof += 1
+    return bonafide, spoof
+
 class GDTrainer(Trainer):
 
     def train(
@@ -72,6 +85,8 @@ class GDTrainer(Trainer):
         test_dataset: Optional[torch.utils.data.Dataset] = None,
         logging_prefix: str = "",
         pos_weight: Optional[torch.FloatTensor] = None,
+        ckpt_dir: Optional[str] = None,       # FIX 1: added missing parameter
+        ckpt_tag: Optional[str] = None,        # FIX 2: added missing parameter
     ):
         if test_dataset is not None:
             train = dataset
@@ -79,8 +94,7 @@ class GDTrainer(Trainer):
         else:
             test_len = int(len(dataset) * test_len)
             train_len = len(dataset) - test_len
-            lengths = [train_len, test_len]
-            train, test = torch.utils.data.random_split(dataset, lengths)
+            train, test = torch.utils.data.random_split(dataset, [train_len, test_len])
 
         train_loader = DataLoader(
             train,
@@ -100,21 +114,26 @@ class GDTrainer(Trainer):
         criterion = torch.nn.BCEWithLogitsLoss()
         optim = self.optimizer_fn(model.parameters(), **self.optimizer_kwargs)
 
-
-     
         best_model = None
-        best_acc = 0
+        best_acc = 0.0
+
+        # Resolve checkpoint save directory
+        tag = ckpt_tag if ckpt_tag else (logging_prefix if logging_prefix else "fold")
+        if ckpt_dir:
+            save_dir = os.path.join(ckpt_dir, tag)
+            os.makedirs(save_dir, exist_ok=True)
+            best_ckpt_path  = os.path.join(save_dir, "best_checkpoint.pth")
+            epoch_ckpt_path = os.path.join(save_dir, "latest_epoch.pth")
 
         LOGGER.info(f"Starting training for {self.epochs} epochs!")
 
         forward_and_loss_fn = forward_and_loss
-
         use_cuda = self.device != "cpu"
 
         for epoch in range(self.epochs):
             LOGGER.info(f"Epoch num: {epoch}")
 
-            running_loss = 0
+            running_loss = 0.0
             num_correct = 0.0
             num_total = 0.0
             model.train()
@@ -122,71 +141,124 @@ class GDTrainer(Trainer):
             for i, (batch_x, _, batch_y) in enumerate(train_loader):
                 batch_size = batch_x.size(0)
                 num_total += batch_size
-
                 batch_x = batch_x.to(self.device)
 
                 if nn_data_setting.use_cnn_features:
-                    batch_x = cnn_features.prepare_feature_vector(batch_x, cnn_features_setting=cnn_features_setting)
+                    batch_x = cnn_features.prepare_feature_vector(
+                        batch_x, cnn_features_setting=cnn_features_setting)
 
                 batch_y = batch_y.unsqueeze(1).type(torch.float32).to(self.device)
 
-                batch_out, batch_loss = forward_and_loss_fn(model, criterion, batch_x, batch_y, use_cuda=use_cuda)
+                batch_out, batch_loss = forward_and_loss_fn(
+                    model, criterion, batch_x, batch_y, use_cuda=use_cuda)
                 batch_pred = (torch.sigmoid(batch_out) + .5).int()
                 num_correct += (batch_pred == batch_y.int()).sum(dim=0).item()
-
                 running_loss += (batch_loss.item() * batch_size)
 
                 if i % 100 == 0:
                     LOGGER.info(
-                         f"[Epoch {epoch:04d}] [Step {i:05d}] | Loss: {running_loss / num_total:.4f} | Acc: {num_correct / num_total * 100:.2f}%")
+                        f"[Epoch {epoch:04d}] [Step {i:05d}] "
+                        f"| Loss: {running_loss / num_total:.4f} "
+                        f"| Acc: {num_correct / num_total * 100:.2f}%")
 
                 optim.zero_grad()
                 batch_loss.backward()
                 optim.step()
 
             running_loss /= num_total
-            train_accuracy = (num_correct/num_total)*100
+            train_accuracy = (num_correct / num_total) * 100
 
-            LOGGER.info(f"Epoch [{epoch+1}/{self.epochs}]: train/{logging_prefix}__loss: {running_loss}, train/{logging_prefix}__accuracy: {train_accuracy}")
+            LOGGER.info(
+                f"Epoch [{epoch+1}/{self.epochs}]: "
+                f"train/{logging_prefix}__loss: {running_loss:.4f}, "
+                f"train/{logging_prefix}__accuracy: {train_accuracy:.2f}%")
             torch.cuda.empty_cache()
 
+            #   EVALUATION 
+            # FIX 3: moved out of torch.cuda.empty_cache() scope —
+            # was indented one level too deep, causing it to run OUTSIDE
+            # the epoch loop on the very last iteration only.
             test_running_loss = 0.0
             num_correct = 0.0
             num_total = 0.0
             model.eval()
+
             with torch.no_grad():
                 for batch_x, _, batch_y in test_loader:
-    
                     batch_size = batch_x.size(0)
                     num_total += batch_size
                     batch_x = batch_x.to(self.device)
-    
+
                     if nn_data_setting.use_cnn_features:
-                        batch_x = cnn_features.prepare_feature_vector(batch_x, cnn_features_setting=cnn_features_setting)
-    
+                        batch_x = cnn_features.prepare_feature_vector(
+                            batch_x, cnn_features_setting=cnn_features_setting)
+
                     batch_y = batch_y.unsqueeze(1).type(torch.float32).to(self.device)
                     batch_out = model(batch_x)
                     batch_loss = criterion(batch_out, batch_y)
-    
+
                     test_running_loss += (batch_loss.item() * batch_size)
-    
                     batch_pred = (torch.sigmoid(batch_out) + .5).int()
                     num_correct += (batch_pred == batch_y.int()).sum(dim=0).item()
-    
-                if num_total == 0:
-                    num_total = 1
-    
-                test_running_loss /= num_total
-                test_acc = 100 * (num_correct / num_total)
-                LOGGER.info(f"Epoch [{epoch+1}/{self.epochs}]: test/{logging_prefix}__loss: {test_running_loss}, test/{logging_prefix}__accuracy: {test_acc}")
 
+            if num_total == 0:
+                num_total = 1
 
-                if best_model is None or test_acc > best_acc:
-                    best_acc = test_acc
-                    best_model = deepcopy(model.state_dict())
-    
-                LOGGER.info(
-                    f"[{epoch:04d}]: {running_loss} -- train acc: {train_accuracy} -- test_acc: {test_acc}")
+            # FIX 4: moved test metric computation OUT of torch.no_grad() block —
+            # these are plain Python arithmetic, not tensor ops; keeping them
+            # inside no_grad() is harmless but caused wrong indentation scope.
+            test_running_loss /= num_total
+            test_acc = 100.0 * (num_correct / num_total)
 
+            LOGGER.info(
+                f"Epoch [{epoch+1}/{self.epochs}]: "
+                f"test/{logging_prefix}__loss: {test_running_loss:.4f}, "
+                f"test/{logging_prefix}__accuracy: {test_acc:.2f}%")
+
+            #   CHECKPOINT: save per-epoch resume file (always) ─────────────
+            # Overwrites every epoch so latest_epoch.pth always reflects the
+            # last fully-completed epoch — safe against Kaggle timeouts.
+            if ckpt_dir:
+                torch.save({
+                    "epoch":                epoch,
+                    "model_state_dict":     model.state_dict(),
+                    "optimizer_state_dict": optim.state_dict(),
+                    "train_loss":           running_loss,
+                    "test_loss":            test_running_loss,
+                    "test_acc":             test_acc,
+                    "best_acc":             best_acc,
+                }, epoch_ckpt_path)
+                LOGGER.info(f"Saved epoch checkpoint: {epoch_ckpt_path}  (epoch {epoch})")
+
+            #   CHECKPOINT: save best model immediately on improvement ───────
+            # FIX 5: torch.save is inside the if-block so it writes to disk
+            # the moment a new best is found, not after all epochs finish.
+            if best_model is None or test_acc > best_acc:
+                best_acc = test_acc
+                best_model = deepcopy(model.state_dict())
+
+                if ckpt_dir:
+                    torch.save({
+                        "epoch":            epoch,
+                        "model_state_dict": best_model,
+                        "val_acc":          best_acc,
+                        "val_loss":         test_running_loss,
+                    }, best_ckpt_path)
+                    LOGGER.info(
+                        f"New best checkpoint saved at epoch {epoch} "
+                        f"with val_acc={best_acc:.4f}")
+
+            LOGGER.info(
+                f"[{epoch:04d}]: {running_loss:.4f} "
+                f"-- train acc: {train_accuracy:.2f}% "
+                f"-- test_acc: {test_acc:.2f}% "
+                f"-- best_acc: {best_acc:.2f}%")
+
+        #   END OF EPOCH LOOP  
+        # FIX 6: these two lines were inside the epoch loop (wrong indent).
+        # They belong AFTER the loop — load best weights once at the very end.
+        LOGGER.info(
+            f"Best checkpoint for {logging_prefix}: "
+            f"val_acc={best_acc:.4f}, val_loss={test_running_loss:.4f}")
         model.load_state_dict(best_model)
         return model

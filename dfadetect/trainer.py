@@ -22,19 +22,6 @@ class NNDataSetting:
 
 
 class Trainer():
-    """This is a lightweight wrapper for training models with gradient descent.
-
-    Its main function is to store information about the training process.
-
-    Args:
-        epochs (int): The amount of training epochs.
-        batch_size (int): Amount of audio files to use in one batch.
-        device (str): The device to train on (Default 'cpu').
-        batch_size (int): The amount of audio files to consider in one batch (Default: 32).
-        optimizer_fn (Callable): Function for constructing the optimzer.
-        optimizer_kwargs (dict): Kwargs for the optimzer.
-    """
-
     def __init__(self,
                  epochs: int = 20,
                  batch_size: int = 32,
@@ -91,18 +78,18 @@ class GDTrainer(Trainer):
             batch_size=self.batch_size,
             drop_last=True,
             num_workers=4,
+            pin_memory=True,   
         )
 
         criterion = torch.nn.BCEWithLogitsLoss()
         optim = self.optimizer_fn(model.parameters(), **self.optimizer_kwargs)
+        scaler = torch.cuda.amp.GradScaler()   # FIX 3: AMP scaler
 
         best_model = None
         best_acc = 0
 
         LOGGER.info(f"Starting training for {self.epochs} epochs!")
-
         forward_and_loss_fn = forward_and_loss
-
         use_cuda = self.device != "cpu"
 
         for epoch in range(self.epochs):
@@ -123,8 +110,9 @@ class GDTrainer(Trainer):
                     batch_x = cnn_features.prepare_feature_vector(batch_x, cnn_features_setting=cnn_features_setting)
 
                 batch_y = batch_y.unsqueeze(1).type(torch.float32).to(self.device)
-
-                batch_out, batch_loss = forward_and_loss_fn(model, criterion, batch_x, batch_y, use_cuda=use_cuda)
+                # FIX 3: AMP autocast for training forward
+                with torch.cuda.amp.autocast():
+                    batch_out, batch_loss = forward_and_loss_fn(model, criterion, batch_x, batch_y, use_cuda=use_cuda)
                 batch_pred = (torch.sigmoid(batch_out) + .5).int()
                 num_correct += (batch_pred == batch_y.int()).sum(dim=0).item()
 
@@ -135,19 +123,22 @@ class GDTrainer(Trainer):
                          f"[Epoch {epoch:04d}] [Step {i:05d}] | Loss: {running_loss / num_total:.4f} | Acc: {num_correct / num_total * 100:.2f}%")
 
                 optim.zero_grad()
-                batch_loss.backward()
-                optim.step()
+                scaler.scale(batch_loss).backward()
+                scaler.step(optim)
+                scaler.update()
 
             running_loss /= num_total
-            train_accuracy = (num_correct/num_total)*100
-
+            train_accuracy = (num_correct / num_total) * 100
             LOGGER.info(f"Epoch [{epoch+1}/{self.epochs}]: train/{logging_prefix}__loss: {running_loss}, train/{logging_prefix}__accuracy: {train_accuracy}")
             torch.cuda.empty_cache()
 
+
+            # Evaluation 
             test_running_loss = 0.0
             num_correct = 0.0
             num_total = 0.0
             model.eval()
+
             with torch.no_grad():
                 for batch_x, _, batch_y in test_loader:
     
@@ -159,16 +150,19 @@ class GDTrainer(Trainer):
                         batch_x = cnn_features.prepare_feature_vector(batch_x, cnn_features_setting=cnn_features_setting)
     
                     batch_y = batch_y.unsqueeze(1).type(torch.float32).to(self.device)
-                    batch_out = model(batch_x)
-                    batch_loss = criterion(batch_out, batch_y)
+
+                    with torch.cuda.amp.autocast():   # FIX 3: AMP for eval
+                        batch_out = model(batch_x)
+                        batch_loss = criterion(batch_out, batch_y)
     
                     test_running_loss += (batch_loss.item() * batch_size)
     
                     batch_pred = (torch.sigmoid(batch_out) + .5).int()
                     num_correct += (batch_pred == batch_y.int()).sum(dim=0).item()
-    
-                if num_total == 0:
-                    num_total = 1
+            
+            # FIX 1: post-loop logic outside with block
+            if num_total == 0:
+                num_total = 1
     
                 test_running_loss /= num_total
                 test_acc = 100 * (num_correct / num_total)

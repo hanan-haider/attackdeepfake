@@ -57,21 +57,7 @@ def forward_and_loss(model, criterion, batch_x, batch_y, **kwargs):
     return batch_out, batch_loss
 
 
-# Dataset statistics 
-def count_labels(dataset):
-    """Count bonafide (0) and spoof (1) samples in any dataset/subset."""
-    bonafide = 0
-    spoof    = 0
-    for item in dataset:
-        # item is (waveform, path, label) — label is index 2
-        label = item[2]
-        if hasattr(label, 'item'):
-            label = label.item()   # tensor → int
-        if int(label) == 0:
-            bonafide += 1
-        else:
-            spoof += 1
-    return bonafide, spoof
+
 
 class GDTrainer(Trainer):
 
@@ -215,21 +201,6 @@ class GDTrainer(Trainer):
                 f"test/{logging_prefix}__loss: {test_running_loss:.4f}, "
                 f"test/{logging_prefix}__accuracy: {test_acc:.2f}%")
 
-            #   CHECKPOINT: save per-epoch resume file (always) ─────────────
-            # Overwrites every epoch so latest_epoch.pth always reflects the
-            # last fully-completed epoch — safe against Kaggle timeouts.
-            if ckpt_dir:
-                torch.save({
-                    "epoch":                epoch,
-                    "model_state_dict":     model.state_dict(),
-                    "optimizer_state_dict": optim.state_dict(),
-                    "train_loss":           running_loss,
-                    "test_loss":            test_running_loss,
-                    "test_acc":             test_acc,
-                    "best_acc":             best_acc,
-                }, epoch_ckpt_path)
-                LOGGER.info(f"Saved epoch checkpoint: {epoch_ckpt_path}  (epoch {epoch})")
-
             #   CHECKPOINT: save best model immediately on improvement ───────
             # FIX 5: torch.save is inside the if-block so it writes to disk
             # the moment a new best is found, not after all epochs finish.
@@ -244,6 +215,7 @@ class GDTrainer(Trainer):
                         "val_acc":          best_acc,
                         "val_loss":         test_running_loss,
                     }, best_ckpt_path)
+                    
                     LOGGER.info(
                         f"New best checkpoint saved at epoch {epoch} "
                         f"with val_acc={best_acc:.4f}")

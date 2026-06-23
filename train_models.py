@@ -120,7 +120,7 @@ def train_nn(
             f"| bonafide: {train_bonafide:>6,}  | spoof: {train_spoof:>7,}\n"
             f"  Validation(TEST)   → total: {test_bonafide  + test_spoof:>7,}  "
             f"| bonafide: {test_bonafide:>6,}  | spoof: {test_spoof:>7,}\n"
-            f"  Spoof ratio train:   {train_spoof / max(train_bonafide, 1):.2f}:1  "
+            f"             Spoof ratio train:   {train_spoof / max(train_bonafide, 1):.2f}:1  "
             f"|   Spoof ratio test: {test_spoof / max(test_bonafide, 1):.2f}:1\n"
             f"{'='*60}"
         )

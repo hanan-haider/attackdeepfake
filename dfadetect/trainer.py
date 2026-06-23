@@ -83,7 +83,7 @@ class GDTrainer(Trainer):
 
         criterion = torch.nn.BCEWithLogitsLoss()
         optim = self.optimizer_fn(model.parameters(), **self.optimizer_kwargs)
-        scaler = torch.cuda.amp.GradScaler()   # FIX 3: AMP scaler
+        scaler = torch.amp.GradScaler("cuda")   # FIX 3: AMP scaler
 
         best_model = None
         best_acc = 0
@@ -111,7 +111,7 @@ class GDTrainer(Trainer):
 
                 batch_y = batch_y.unsqueeze(1).type(torch.float32).to(self.device)
                 # FIX 3: AMP autocast for training forward
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast(device_type="cuda"):
                     batch_out, batch_loss = forward_and_loss_fn(model, criterion, batch_x, batch_y, use_cuda=use_cuda)
                 batch_pred = (torch.sigmoid(batch_out) + .5).int()
                 num_correct += (batch_pred == batch_y.int()).sum(dim=0).item()
@@ -151,7 +151,7 @@ class GDTrainer(Trainer):
     
                     batch_y = batch_y.unsqueeze(1).type(torch.float32).to(self.device)
 
-                    with torch.cuda.amp.autocast():   # FIX 3: AMP for eval
+                    with torch.amp.autocast(device_type="cuda"):   # FIX 3: AMP for eval
                         batch_out = model(batch_x)
                         batch_loss = criterion(batch_out, batch_y)
     
@@ -164,16 +164,16 @@ class GDTrainer(Trainer):
             if num_total == 0:
                 num_total = 1
     
-                test_running_loss /= num_total
-                test_acc = 100 * (num_correct / num_total)
-                LOGGER.info(f"Epoch [{epoch+1}/{self.epochs}]: test/{logging_prefix}__loss: {test_running_loss}, test/{logging_prefix}__accuracy: {test_acc}")
+            test_running_loss /= num_total
+            test_acc = 100 * (num_correct / num_total)
+            LOGGER.info(f"Epoch [{epoch+1}/{self.epochs}]: test/{logging_prefix}__loss: {test_running_loss}, test/{logging_prefix}__accuracy: {test_acc}")
 
 
-                if best_model is None or test_acc > best_acc:
-                    best_acc = test_acc
-                    best_model = deepcopy(model.state_dict())
+            if best_model is None or test_acc > best_acc:
+                best_acc = test_acc
+                best_model = deepcopy(model.state_dict())
     
-                LOGGER.info(
+            LOGGER.info(
                     f"[{epoch:04d}]: {running_loss} -- train acc: {train_accuracy} -- test_acc: {test_acc}")
 
         model.load_state_dict(best_model)

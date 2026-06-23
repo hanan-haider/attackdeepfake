@@ -90,8 +90,7 @@ def train_nn(
 
         )
 
-        data_test = AttackAgnosticDataset(
-            
+        data_test = AttackAgnosticDataset(   
             asvspoof_path=datasets_paths[0],
             wavefake_path=datasets_paths[1],
             fakeavceleb_path=datasets_paths[2],

@@ -15,6 +15,13 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 LOGGER = logging.getLogger(__name__)
+# Reconfigure the root logger to only print the message
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(message)s', 
+    force=True  # Forces override of existing loggers
+)
+
 
 @dataclass
 class NNDataSetting:

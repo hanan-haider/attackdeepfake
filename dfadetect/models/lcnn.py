@@ -390,7 +390,7 @@ class LCNN(nn.Module):
 
         # CNN backbone — optionally gradient-checkpointed
         # use_reentrant=False: safer with autocast / AMP training
-        if self.use_ckpt and self.training:
+        if self.use_ckpt:
             x = checkpoint(self._run_stem,   x, use_reentrant=False)
             x = checkpoint(self._run_stage2, x, use_reentrant=False)
             x = checkpoint(self._run_stage3, x, use_reentrant=False)

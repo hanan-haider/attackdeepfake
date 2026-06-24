@@ -80,21 +80,22 @@ def train_nn(
             undersample=undersample,
         )
 
-        data_test = AttackAgnosticDataset(
-            asvspoof_path=datasets_paths[0],
-            wavefake_path=datasets_paths[1],
-            fakeavceleb_path=datasets_paths[2],
-            fold_num=fold,
-            fold_subset="val",
-            reduced_number=amount_to_use,
-        )
-
         data_val = AttackAgnosticDataset(
             asvspoof_path=datasets_paths[0],
             wavefake_path=datasets_paths[1],
             fakeavceleb_path=datasets_paths[2],
             fold_num=fold,
             fold_subset="test",
+            reduced_number=amount_to_use,
+            oversample=oversample,
+        )
+
+        data_test = AttackAgnosticDataset(
+            asvspoof_path=datasets_paths[0],
+            wavefake_path=datasets_paths[1],
+            fakeavceleb_path=datasets_paths[2],
+            fold_num=fold,
+            fold_subset="val",
             reduced_number=amount_to_use,
         )
 

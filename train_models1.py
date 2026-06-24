@@ -111,9 +111,9 @@ def train_nn(
         test_spoof     = test_label_counts.get("spoof",     0)
 
         LOGGER.info(
-            f"\n{'='*60}\n"
+            f"\n{'='*70}\n"
             f"  Fold {fold} — Dataset Statistics\n"
-            f"{'='*60}\n"
+            f"{'='*70}\n"
             f"  TRAIN            → total: {train_bonafide + train_spoof:>7,} "
             f"| bonafide: {train_bonafide:>6,} | spoof: {train_spoof:>7,}\n"
             f"  Validation (test) → total: {val_bonafide   + val_spoof:>7,} "
@@ -123,7 +123,7 @@ def train_nn(
             f"  Spoof ratio  — train: {train_spoof / max(train_bonafide, 1):.2f}:1"
             f"  | val: {val_spoof / max(val_bonafide, 1):.2f}:1"
             f"  | test: {test_spoof / max(test_bonafide, 1):.2f}:1\n"
-            f"{'='*60}"
+            f"{'='*70}"
         )
 
         # ── pos_weight for BCEWithLogitsLoss (train split only) ───────────

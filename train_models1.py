@@ -101,8 +101,8 @@ def train_nn(
 
         # ── Dataset Statistics ────────────────────────────────────────────
         train_label_counts = data_train.samples["label"].value_counts()
-        val_label_counts   = data_test.samples["label"].value_counts()
-        test_label_counts  = data_val.samples["label"].value_counts()
+        val_label_counts   = data_val.samples["label"].value_counts()
+        test_label_counts  = data_test.samples["label"].value_counts()
 
         train_bonafide = train_label_counts.get("bonafide", 0)
         train_spoof    = train_label_counts.get("spoof",    0)

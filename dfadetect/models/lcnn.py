@@ -6,39 +6,7 @@ currently it is unstable...
 Improved LCNN for Audio Deepfake Detection — Final Memory-Safe Edition
 =======================================================================
 
-ROOT CAUSE OF ALL PREVIOUS OOMs
-─────────────────────────────────
-MaxFeatureMap2D used:   m, _ = x.view(*shape).max(d)
-torch.Tensor.max() returns (values, indices).
-The indices tensor is int64 (8 bytes/element) vs float32 (4 bytes).
-For a large batch it allocated a SECOND full-size int64 tensor just
-to throw it away with `_`.
 
-Example — batch=512, stem conv output [512, 64, 404, 80]:
-  values  tensor: 512×32×404×80 × 4B = 2.64 GB
-  indices tensor: 512×32×404×80 × 8B = 5.29 GB  ← this caused OOM
-  Total needed at peak: ~8 GB  (before any other stage)
-
-FIX 1 — Replace .max() with torch.amax()
-  torch.amax() returns ONLY the values, no indices.
-  Peak drops from ~8 GB → ~2.64 GB for the same op.
-
-FIX 2 — Gradient checkpointing on CNN stages
-  torch.utils.checkpoint stores only stage inputs/outputs during
-  forward; recomputes intermediates on the backward pass.
-  Reduces backprop activation memory by ~50-60%.
-
-Together these bring peak VRAM well within 14.5 GB even at large batch.
-
-Quality improvements kept from previous iterations:
-  ✅ SEBlock channel attention after every MFM
-  ✅ FrequencyAttention depthwise spatial gate
-  ✅ BLSTM → pre-norm Transformer → BLSTM temporal pipeline
-  ✅ Safe BLSTM residual (dims always match)
-  ✅ Attentive statistics pooling
-  ✅ Two-layer MLP head  (raw logit — use BCEWithLogitsLoss)
-  ✅ SpecAugment built-in (training only)
-  ✅ Kaiming init on Conv2d layers
 """
 
 import sys

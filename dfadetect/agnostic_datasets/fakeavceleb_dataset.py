@@ -33,9 +33,6 @@ FAKEAVCELEB_KFOLD_SPLIT = {
 
 class FakeAVCelebDataset(SimpleAudioFakeDataset):
 
-    # FIX 1: Removed the leading space from audio_folder.
-    # Was: audio_folder = " "   ← space caused " /FakeVideo-FakeAudio/..." (invalid path)
-    # Now: audio_folder = ""    ← empty; real path comes from self.path passed at init
     audio_folder = ""
     audio_extension = ".flac"
     metadata_file = "meta_data_selected_methods.csv"

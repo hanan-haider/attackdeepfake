@@ -167,20 +167,19 @@ class GDTrainer(Trainer):
                     batch_pred = (torch.sigmoid(batch_out) + .5).int()
                     num_correct += (batch_pred == batch_y.int()).sum(dim=0).item()
             
-            # FIX 1: post-loop logic outside with block
-            if num_total == 0:
-                num_total = 1
+                if num_total == 0:
+                    num_total = 1
     
-            test_running_loss /= num_total
-            test_acc = 100 * (num_correct / num_total)
-            LOGGER.info(f"Epoch [{epoch+1}/{self.epochs}]: test/{logging_prefix}__loss: {test_running_loss}, test/{logging_prefix}__accuracy: {test_acc}")
+                test_running_loss /= num_total
+                test_acc = 100 * (num_correct / num_total)
+                LOGGER.info(f"Epoch [{epoch+1}/{self.epochs}]: test/{logging_prefix}__loss: {test_running_loss}, test/{logging_prefix}__accuracy: {test_acc}")
 
 
-            if best_model is None or test_acc > best_acc:
-                best_acc = test_acc
-                best_model = deepcopy(model.state_dict())
+                if best_model is None or test_acc > best_acc:
+                    best_acc = test_acc
+                    best_model = deepcopy(model.state_dict())
     
-            LOGGER.info(
+                LOGGER.info(
                     f"[{epoch:04d}]: {running_loss} -- train acc: {train_accuracy} -- test_acc: {test_acc}")
 
         model.load_state_dict(best_model)

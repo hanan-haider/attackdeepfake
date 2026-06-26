@@ -7,20 +7,6 @@ from dfadetect.agnostic_datasets.base_dataset import SimpleAudioFakeDataset
 
 ASVSPOOF_KFOLD_SPLIT = {
     0: {
-        "train": ['A01', 'A02', 'A03', 'A04', 'A07', 'A08', 'A09', 'A10', 'A11', 'A12', 'A13', 'A14', 'A19'],
-        "test": ['A05', 'A15', 'A16'],
-        "val": ['A06', 'A17', 'A18'],
-        "bonafide_partition": [0.7, 0.15],
-        "seed": 42
-    },
-    1: {
-        "train": ['A01', 'A02', 'A05', 'A06', 'A07', 'A08', 'A09', 'A10', 'A15', 'A16', 'A17', 'A18', 'A19'],
-        "test": ['A03', 'A11', 'A12'],
-        "val": ['A04', 'A13', 'A14'],
-        "bonafide_partition": [0.7, 0.15],
-        "seed": 43
-    },
-    2: {
         "train": ['A03', 'A04', 'A05', 'A06', 'A11', 'A12', 'A13', 'A14', 'A15', 'A16', 'A17', 'A18', 'A19'],
         "test": ['A01', 'A07', 'A08'],
         "val": ['A02', 'A09', 'A10'],
